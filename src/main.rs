@@ -15,6 +15,7 @@ use whale::writer::format_hex_string;
 fn main() -> io::Result<()> {
     let config = CliConfig::parse();
     let is_summary_only = config.format == OutputFormat::Summary;
+    let is_diff_mode = config.is_diff_mode();
     let skip_summary = config.skip_summary;
     let summary_output_file = if is_summary_only {
         config.output.clone()
@@ -68,8 +69,6 @@ fn main() -> io::Result<()> {
         b"SYMLINKS_V1:",
     ));
 
-    // When `--format summary` is combined with `-o / --output <FILE>`, write the summary
-    // to the requested file instead of printing to the console.
     let mut summary_out: Box<dyn Write> = match summary_output_file {
         Some(ref path) => Box::new(BufWriter::new(File::create(path)?)),
         None if is_summary_only => Box::new(io::stdout()),
@@ -95,6 +94,31 @@ fn main() -> io::Result<()> {
         (total_entries as f64) / secs,
         (total_bytes as f64) / (1024.0 * 1024.0) / secs
     )?;
+
+    if is_diff_mode {
+        writeln!(
+            summary_out,
+            "Baseline Indexed Rows  : {}",
+            telemetry.baseline_loaded_count.load(Ordering::Relaxed)
+        )?;
+        writeln!(
+            summary_out,
+            "Unchanged Entries      : {}",
+            telemetry.unchanged_count.load(Ordering::Relaxed)
+        )?;
+        writeln!(
+            summary_out,
+            "Total Differences      : {} (added: {}, deleted: {}, content: {}, mode: {}, content+mode: {}, type: {})",
+            telemetry.total_differences(),
+            telemetry.added_count.load(Ordering::Relaxed),
+            telemetry.deleted_count.load(Ordering::Relaxed),
+            telemetry.modified_content_count.load(Ordering::Relaxed),
+            telemetry.modified_mode_count.load(Ordering::Relaxed),
+            telemetry.modified_content_and_mode_count.load(Ordering::Relaxed),
+            telemetry.modified_type_count.load(Ordering::Relaxed),
+        )?;
+    }
+
     writeln!(
         summary_out,
         "File Contents SHA-256  : {}",

@@ -56,7 +56,6 @@ pub fn build_writer_properties(
         .set_compression(codec)
         .set_max_row_group_size(row_group_size.max(1024))
         .set_dictionary_enabled(false)
-        // Enable dictionary encoding specifically for low-cardinality columns
         .set_column_dictionary_enabled(ColumnPath::from("kind"), true)
         .set_column_dictionary_enabled(ColumnPath::from("mode_octal"), true)
         .set_column_dictionary_enabled(ColumnPath::from("mode_sha256"), true)

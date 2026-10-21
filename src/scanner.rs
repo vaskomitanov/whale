@@ -10,10 +10,11 @@ use crossbeam_channel::Sender;
 use rayon::ScopeFifo;
 
 use crate::config::{CliConfig, FILE_CHUNK_SIZE, RECORD_BATCH_SIZE};
+use crate::diff::{evaluate_live_record_diff, ShardedBaselineIndex};
 use crate::hasher::{
     compute_composite_sha256, extract_mode, hash_file_contents_and_mode, hash_mode, hash_os_str,
 };
-use crate::model::{EntryKind, ScanRecord};
+use crate::model::{DiffRecord, EntryKind, ScanRecord};
 use crate::telemetry::ScanTelemetry;
 
 thread_local! {
@@ -27,12 +28,21 @@ pub struct ScannerContext {
     pub root_base: PathBuf,
     pub telemetry: ScanTelemetry,
     pub tx: Option<Sender<Vec<ScanRecord>>>,
+    /// Present when running in `--compare <PARQUET_FILE>` mode for on-the-fly O(1) diff evaluation.
+    pub baseline_index: Option<ShardedBaselineIndex>,
+    pub diff_tx: Option<Sender<Vec<DiffRecord>>>,
 }
 
 impl ScannerContext {
     #[inline]
     pub fn emit_record(&self, record: ScanRecord) {
         self.telemetry.record_entry(&record);
+
+        if let Some(ref baseline) = self.baseline_index {
+            evaluate_live_record_diff(record, baseline, &self.telemetry, &self.diff_tx);
+            return;
+        }
+
         if let Some(ref tx) = self.tx {
             LOCAL_BATCH.with(|cell| {
                 let mut batch = cell.borrow_mut();
@@ -205,10 +215,6 @@ pub fn process_symlink(ctx: &ScannerContext, path: PathBuf) {
 
 /// Processes a directory entry's own name, mode, and relative path hash, then dispatches all
 /// children into Rayon's work-stealing FIFO queue.
-///
-/// **Crucial scalability invariant**: `fs::read_dir` is drained into compact `PathBuf` vectors
-/// and dropped *before* spawning recursive directory tasks, ensuring at most `O(num_threads)`
-/// directory file descriptors are open concurrently even on trees millions of directories wide/deep!
 pub fn process_directory<'scope>(
     ctx: &'scope ScannerContext,
     scope: &ScopeFifo<'scope>,
@@ -300,21 +306,19 @@ pub fn process_directory<'scope>(
         // `read_dir` is dropped here, releasing the OS directory FD before any child tasks run!
     }
 
-    // 4. Spawn child directories into Rayon's FIFO work-stealing queue first so idle cores
-    //    can immediately begin expanding subdirectories in parallel.
+    // 4. Spawn child directories into Rayon's FIFO work-stealing queue first
     for subdir in subdirs {
         scope.spawn_fifo(move |s| {
             process_directory(ctx, s, subdir);
         });
     }
 
-    // 5. Process symlinks.
+    // 5. Process symlinks
     for symlink_path in symlinks {
         process_symlink(ctx, symlink_path);
     }
 
-    // 6. Dispatch files in adaptive chunks (64 files per task) to balance work-stealing
-    //    granularity against task-spawning overhead when a single directory contains 100k+ files.
+    // 6. Dispatch files in adaptive chunks (64 files per task)
     if files.len() <= FILE_CHUNK_SIZE {
         for file_path in files {
             process_file(ctx, file_path);

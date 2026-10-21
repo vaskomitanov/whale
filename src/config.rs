@@ -21,28 +21,53 @@ pub const FILE_CHUNK_SIZE: usize = 64;
 /// Default number of rows per Apache Parquet row group (65,536 rows) for bounded memory streaming.
 pub const DEFAULT_PARQUET_ROW_GROUP_SIZE: usize = 65_536;
 
+/// Number of independent hash-table shards in `ShardedBaselineIndex` (power of two: 256).
+pub const BASELINE_SHARD_COUNT: usize = 256;
+
 /// CLI configuration for `whale`.
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "whale",
     version,
-    about = "Whale: ultra-scalable parallel recursive SHA-256 scanner supporting TSV, JSONL, and Apache Parquet output."
+    about = "Whale: ultra-scalable parallel recursive SHA-256 scanner and Parquet snapshot diff engine."
 )]
 pub struct CliConfig {
     /// Root directory (or file/symlink) path to scan recursively.
     #[arg(default_value = ".")]
     pub root: PathBuf,
 
-    /// Output format: `tsv`, `jsonl`, `parquet`, or `summary`.
+    /// Compare live filesystem entries against a previously indexed Apache Parquet file
+    /// and output only the differences (`ADDED`, `DELETED`, `MODIFIED_*`).
+    #[arg(
+        short = 'c',
+        long = "compare",
+        visible_aliases = ["diff", "baseline"],
+        value_name = "PARQUET_FILE",
+        conflicts_with = "compare_snapshots"
+    )]
+    pub compare: Option<PathBuf>,
+
+    /// Directly compare two existing Apache Parquet snapshot files (`<OLD_PARQUET> <NEW_PARQUET>`)
+    /// in parallel across row groups without scanning the live filesystem.
+    #[arg(
+        long = "compare-snapshots",
+        visible_aliases = ["diff-snapshots", "compare-parquet"],
+        num_args = 2,
+        value_names = ["OLD_PARQUET", "NEW_PARQUET"],
+        conflicts_with = "compare"
+    )]
+    pub compare_snapshots: Option<Vec<PathBuf>>,
+
+    /// Output format for scan or diff records: `tsv`, `jsonl`, `parquet`, or `summary`.
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Tsv)]
     pub format: OutputFormat,
 
-    /// Write output to a file path instead of printing to the console (`stdout`).
-    /// Defaults to `whale_output.parquet` when `--format parquet` is selected without `-o`.
+    /// Write scan or diff output to a file path instead of printing to the console (`stdout`).
+    /// Defaults to `whale_output.parquet` (or `whale_diff.parquet` in comparison modes) when `--format parquet` is used without `-o`.
     #[arg(short = 'o', long = "output", visible_alias = "output-file", value_name = "FILE")]
     pub output: Option<PathBuf>,
 
-    /// Skip printing the summary report and aggregate SHA-256 digests at the end of the scan.
+    /// Skip printing the summary report and aggregate SHA-256 digests at the end of the run.
     #[arg(short = 'S', long = "skip-summary", visible_alias = "no-summary", default_value_t = false)]
     pub skip_summary: bool,
 
@@ -75,16 +100,24 @@ pub struct CliConfig {
     pub parquet_row_group_size: usize,
 }
 
+impl CliConfig {
+    /// Returns `true` if either `--compare` or `--compare-snapshots` is active.
+    #[inline]
+    pub fn is_diff_mode(&self) -> bool {
+        self.compare.is_some() || self.compare_snapshots.is_some()
+    }
+}
+
 /// Supported output serialization formats.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// Tab-separated values: `KIND\tMODE_OCTAL\tMODE_SHA256\tNAME_SHA256\tPAYLOAD_SHA256\tCOMPOSITE_SHA256\tSIZE_BYTES\tPATH\tSYMLINK_TARGET`
+    /// Tab-separated values
     Tsv,
-    /// JSON Lines (one compact JSON object per entry)
+    /// JSON Lines (one compact JSON object per entry or diff)
     Jsonl,
     /// Apache Parquet columnar binary format (streamed in bounded row groups)
     Parquet,
-    /// Only emit final summary statistics and aggregate root SHA-256 digests
+    /// Only emit final summary statistics and aggregate root SHA-256 digests / diff counts
     Summary,
 }
 

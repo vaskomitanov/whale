@@ -1,9 +1,8 @@
 [package]
-authors = ["vasko.mitanov@gmail.com"]
 name = "whale"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
-description = "Whale: ultra-fast, massively scalable recursive directory scanner computing SHA-256 digests of file contents, file names, directory names, file/directory modes, and symlinks with TSV, JSONL, and Apache Parquet output."
+description = "Whale: ultra-fast, massively scalable recursive directory scanner and Parquet snapshot diff engine computing SHA-256 digests of file contents, file names, directory names, file/directory modes, and symlinks."
 license = "MIT OR Apache-2.0"
 
 [lib]
@@ -28,10 +27,12 @@ clap = { version = "4.5", features = ["derive"] }
 # Fast SIMD hex & integer formatting without heap allocations
 faster-hex = "0.9"
 itoa = "1.0"
-# Apache Arrow & Apache Parquet columnar output with ZSTD, Snappy, and Gzip compression
-arrow-array = "53.4.1"
-arrow-schema = "53.4.1"
-parquet = { version = "53.4.1", default-features = false, features = ["arrow", "zstd", "snap", "flate2"] }
+# Ultra-fast non-cryptographic hashing for the 256-shard in-memory baseline index
+rustc-hash = "2.0"
+# Apache Arrow & Apache Parquet columnar reader/writer with ZSTD, Snappy, and Gzip compression
+arrow-array = "53.2"
+arrow-schema = "53.2"
+parquet = { version = "53.2", default-features = false, features = ["arrow", "zstd", "snap", "flate2"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
-use crate::model::{EntryKind, ScanRecord};
+use crate::model::{DiffStatus, EntryKind, ScanRecord};
 
 /// Lock-free atomic telemetry and order-independent 256-bit multiset accumulators.
 pub struct ScanTelemetry {
@@ -12,6 +12,15 @@ pub struct ScanTelemetry {
     pub symlinks_count: AtomicU64,
     pub errors_count: AtomicU64,
     pub total_file_bytes: AtomicU64,
+    /// Diff counters populated when running in `--compare` or `--compare-snapshots` mode.
+    pub baseline_loaded_count: AtomicU64,
+    pub unchanged_count: AtomicU64,
+    pub added_count: AtomicU64,
+    pub deleted_count: AtomicU64,
+    pub modified_content_count: AtomicU64,
+    pub modified_mode_count: AtomicU64,
+    pub modified_content_and_mode_count: AtomicU64,
+    pub modified_type_count: AtomicU64,
     /// Order-independent 256-bit accumulators (4 x 64-bit wrapping sum of digests)
     /// so parallel runs over millions of entries always produce deterministic aggregate digests.
     pub multiset_hash: [AtomicU64; 4],
@@ -40,6 +49,14 @@ impl Default for ScanTelemetry {
             symlinks_count: AtomicU64::new(0),
             errors_count: AtomicU64::new(0),
             total_file_bytes: AtomicU64::new(0),
+            baseline_loaded_count: AtomicU64::new(0),
+            unchanged_count: AtomicU64::new(0),
+            added_count: AtomicU64::new(0),
+            deleted_count: AtomicU64::new(0),
+            modified_content_count: AtomicU64::new(0),
+            modified_mode_count: AtomicU64::new(0),
+            modified_content_and_mode_count: AtomicU64::new(0),
+            modified_type_count: AtomicU64::new(0),
             multiset_hash: zero_accumulator(),
             file_content_multiset: zero_accumulator(),
             file_name_multiset: zero_accumulator(),
@@ -104,5 +121,41 @@ impl ScanTelemetry {
                 Self::fold_digest(&self.symlink_multiset, &record.composite_sha256);
             }
         }
+    }
+
+    /// Increments the atomic counter corresponding to a detected `DiffStatus`.
+    #[inline]
+    pub fn record_diff(&self, status: DiffStatus) {
+        match status {
+            DiffStatus::Added => {
+                self.added_count.fetch_add(1, Ordering::Relaxed);
+            }
+            DiffStatus::Deleted => {
+                self.deleted_count.fetch_add(1, Ordering::Relaxed);
+            }
+            DiffStatus::ModifiedContent => {
+                self.modified_content_count.fetch_add(1, Ordering::Relaxed);
+            }
+            DiffStatus::ModifiedMode => {
+                self.modified_mode_count.fetch_add(1, Ordering::Relaxed);
+            }
+            DiffStatus::ModifiedContentAndMode => {
+                self.modified_content_and_mode_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            DiffStatus::ModifiedType => {
+                self.modified_type_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn total_differences(&self) -> u64 {
+        self.added_count.load(Ordering::Relaxed)
+            + self.deleted_count.load(Ordering::Relaxed)
+            + self.modified_content_count.load(Ordering::Relaxed)
+            + self.modified_mode_count.load(Ordering::Relaxed)
+            + self.modified_content_and_mode_count.load(Ordering::Relaxed)
+            + self.modified_type_count.load(Ordering::Relaxed)
     }
 }
