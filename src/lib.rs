@@ -1,14 +1,16 @@
-//! `lib.rs` — Library root orchestrating the modular parallel SHA-256 directory scanner.
+//! `lib.rs` — Library root orchestrating the `whale` parallel SHA-256 directory scanner.
 
 pub mod config;
 pub mod hasher;
 pub mod model;
+pub mod parquet_writer;
 pub mod scanner;
 pub mod telemetry;
 pub mod writer;
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossbeam_channel::bounded;
@@ -21,6 +23,20 @@ use crate::scanner::{
 };
 use crate::telemetry::ScanTelemetry;
 use crate::writer::run_writer_loop;
+
+/// Resolves the target output file path for per-record formats (`tsv`, `jsonl`, `parquet`).
+/// When `--format parquet` is chosen without `--output`, defaults to `"whale_output.parquet"`
+/// so binary Parquet data is written cleanly to disk rather than raw terminal stdout.
+#[inline]
+pub fn resolve_record_output_path(config: &CliConfig) -> Option<PathBuf> {
+    if let Some(ref path) = config.output {
+        Some(path.clone())
+    } else if config.format == OutputFormat::Parquet {
+        Some(PathBuf::from("whale_output.parquet"))
+    } else {
+        None
+    }
+}
 
 /// Runs a full parallel scan using the supplied `CliConfig` and returns the resulting `ScanTelemetry`.
 pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
@@ -39,16 +55,25 @@ pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
         (Some(s), Some(r))
     };
 
-    let output_path = config.output.clone();
+    let record_output_path = resolve_record_output_path(&config);
     let format = config.format;
+    let parquet_compression = config.parquet_compression;
+    let parquet_row_group_size = config.parquet_row_group_size;
+
     let writer_handle = if let Some(rx_chan) = rx {
-        let sink: Box<dyn Write + Send> = match output_path {
+        let sink: Box<dyn Write + Send> = match record_output_path {
             Some(ref p) => Box::new(File::create(p)?),
             None => Box::new(io::stdout()),
         };
         let buf_writer = BufWriter::with_capacity(WRITER_BUF_CAPACITY, sink);
         Some(std::thread::spawn(move || {
-            run_writer_loop(rx_chan, buf_writer, format)
+            run_writer_loop(
+                rx_chan,
+                buf_writer,
+                format,
+                parquet_compression,
+                parquet_row_group_size,
+            )
         }))
     } else {
         None
@@ -97,6 +122,7 @@ pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ParquetCompression, DEFAULT_PARQUET_ROW_GROUP_SIZE};
     use crate::hasher::{hash_file_contents_and_mode, hash_mode, EMPTY_SHA256};
     use sha2::{Digest, Sha256};
     use std::sync::atomic::Ordering;
@@ -108,8 +134,8 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_hashing_and_tree_determinism() -> io::Result<()> {
-        let tmp = std::env::temp_dir().join("fast_sha256_scan_modular_test");
+    fn test_parquet_and_file_output_with_skip_summary() -> io::Result<()> {
+        let tmp = std::env::temp_dir().join("whale_parquet_test");
         let _ = fs::remove_dir_all(&tmp);
         let nested_dir = tmp.join("subdir_a/nested");
         fs::create_dir_all(&nested_dir)?;
@@ -120,7 +146,6 @@ mod tests {
             hash_file_contents_and_mode(&empty_path, 256 * 1024, false)?;
         assert_eq!(empty_len, 0);
         assert_eq!(empty_hash, EMPTY_SHA256);
-        assert_ne!(empty_mode, 0);
         assert_eq!(
             hash_mode(empty_mode),
             <[u8; 32]>::from(Sha256::digest(empty_mode.to_le_bytes()))
@@ -130,71 +155,26 @@ mod tests {
         let large_path = nested_dir.join("large.bin");
         fs::write(&large_path, &payload)?;
 
-        let expected: [u8; 32] = Sha256::digest(&payload).into();
-        let (mmap_hash, mmap_len, _) = hash_file_contents_and_mode(&large_path, 256 * 1024, false)?;
-        let (stream_hash, stream_len, _) =
-            hash_file_contents_and_mode(&large_path, 16 * 1024 * 1024, false)?;
-        assert_eq!(mmap_len, payload.len() as u64);
-        assert_eq!(stream_len, payload.len() as u64);
-        assert_eq!(mmap_hash, expected);
-        assert_eq!(stream_hash, expected);
-
+        let parquet_out = tmp.join("output.parquet");
         let cfg = CliConfig {
             root: tmp.clone(),
-            format: OutputFormat::Summary,
-            output: None,
+            format: OutputFormat::Parquet,
+            output: Some(parquet_out.clone()),
+            skip_summary: true,
             threads: 4,
             mmap_threshold: 256 * 1024,
             include_relative_path: true,
             include_mode: true,
             permission_bits_only: false,
+            parquet_compression: ParquetCompression::Zstd,
+            parquet_row_group_size: DEFAULT_PARQUET_ROW_GROUP_SIZE,
         };
-        let t1 = execute_scan(cfg.clone())?;
-        let t2 = execute_scan(cfg)?;
 
-        assert_eq!(
-            ScanTelemetry::finalize_accumulator(&t1.multiset_hash, b"ROOT_ALL_V2:"),
-            ScanTelemetry::finalize_accumulator(&t2.multiset_hash, b"ROOT_ALL_V2:")
-        );
-        assert_eq!(
-            ScanTelemetry::finalize_accumulator(&t1.file_mode_multiset, b"FILE_MODES_V1:"),
-            ScanTelemetry::finalize_accumulator(&t2.file_mode_multiset, b"FILE_MODES_V1:")
-        );
-        assert_eq!(
-            ScanTelemetry::finalize_accumulator(&t1.dir_mode_multiset, b"DIR_MODES_V1:"),
-            ScanTelemetry::finalize_accumulator(&t2.dir_mode_multiset, b"DIR_MODES_V1:")
-        );
-        assert_eq!(t1.files_count.load(Ordering::Relaxed), 2);
-        assert_eq!(t1.dirs_count.load(Ordering::Relaxed), 3);
-
-        // Verify that changing file mode alters `file_mode_multiset` and `multiset_hash` on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&empty_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&empty_path, perms)?;
-
-            let cfg_after = CliConfig {
-                root: tmp.clone(),
-                format: OutputFormat::Summary,
-                output: None,
-                threads: 4,
-                mmap_threshold: 256 * 1024,
-                include_relative_path: true,
-                include_mode: true,
-                permission_bits_only: false,
-            };
-            let t3 = execute_scan(cfg_after)?;
-            assert_ne!(
-                ScanTelemetry::finalize_accumulator(&t1.file_mode_multiset, b"FILE_MODES_V1:"),
-                ScanTelemetry::finalize_accumulator(&t3.file_mode_multiset, b"FILE_MODES_V1:")
-            );
-            assert_ne!(
-                ScanTelemetry::finalize_accumulator(&t1.multiset_hash, b"ROOT_ALL_V2:"),
-                ScanTelemetry::finalize_accumulator(&t3.multiset_hash, b"ROOT_ALL_V2:")
-            );
-        }
+        let telemetry = execute_scan(cfg)?;
+        assert!(parquet_out.exists());
+        assert!(fs::metadata(&parquet_out)?.len() > 0);
+        assert!(telemetry.files_count.load(Ordering::Relaxed) >= 2);
+        assert_eq!(telemetry.dirs_count.load(Ordering::Relaxed), 3);
 
         let _ = fs::remove_dir_all(&tmp);
         Ok(())

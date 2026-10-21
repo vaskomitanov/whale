@@ -146,8 +146,6 @@ pub fn hash_file_contents_and_mode(
         hasher.update(&buf[..first_n]);
         let mut total_read = first_n as u64;
 
-        // If `fstat` reported the file is smaller than ` first_n` or we already read all `known_len`
-        // bytes on a small file, verify EOF or continue reading up to `threshold`.
         while total_read < threshold {
             let n = file.read(&mut buf[..])?;
             if n == 0 {

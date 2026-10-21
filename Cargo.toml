@@ -1,0 +1,44 @@
+[package]
+authors = ["vasko.mitanov@gmail.com"]
+name = "whale"
+version = "0.3.0"
+edition = "2021"
+description = "Whale: ultra-fast, massively scalable recursive directory scanner computing SHA-256 digests of file contents, file names, directory names, file/directory modes, and symlinks with TSV, JSONL, and Apache Parquet output."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "whale"
+path = "src/lib.rs"
+
+[[bin]]
+name = "whale"
+path = "src/main.rs"
+
+[dependencies]
+# Hardware-accelerated SHA-256 (Intel SHA-NI, AVX2, ARMv8 Crypto extensions)
+sha2 = { version = "0.10", features = ["asm"] }
+# Work-stealing parallelism for millions of directory entries and file hashing
+rayon = "1.10"
+# High-performance bounded MPMC channels for batched non-blocking I/O output
+crossbeam-channel = "0.5"
+# Cross-platform memory-mapped I/O for large files
+memmap2 = "0.9"
+# Ergonomic CLI parsing with zero runtime overhead after startup
+clap = { version = "4.5", features = ["derive"] }
+# Fast SIMD hex & integer formatting without heap allocations
+faster-hex = "0.9"
+itoa = "1.0"
+# Apache Arrow & Apache Parquet columnar output with ZSTD, Snappy, and Gzip compression
+arrow-array = "53.4.1"
+arrow-schema = "53.4.1"
+parquet = { version = "53.4.1", default-features = false, features = ["arrow", "zstd", "snap", "flate2"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

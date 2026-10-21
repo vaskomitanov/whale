@@ -1,6 +1,7 @@
-//! `main.rs` — Binary entrypoint for `fast-sha256-scan`.
+//! `main.rs` — Binary entrypoint for `whale`.
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -14,11 +15,21 @@ use whale::writer::format_hex_string;
 fn main() -> io::Result<()> {
     let config = CliConfig::parse();
     let is_summary_only = config.format == OutputFormat::Summary;
+    let skip_summary = config.skip_summary;
+    let summary_output_file = if is_summary_only {
+        config.output.clone()
+    } else {
+        None
+    };
+
     let start_time = Instant::now();
-
     let telemetry = execute_scan(config)?;
-
     let elapsed = start_time.elapsed();
+
+    if skip_summary {
+        return Ok(());
+    }
+
     let secs = elapsed.as_secs_f64().max(1e-9);
 
     let files = telemetry.files_count.load(Ordering::Relaxed);
@@ -57,13 +68,15 @@ fn main() -> io::Result<()> {
         b"SYMLINKS_V1:",
     ));
 
-    let mut summary_out: Box<dyn Write> = if is_summary_only {
-        Box::new(io::stdout())
-    } else {
-        Box::new(io::stderr())
+    // When `--format summary` is combined with `-o / --output <FILE>`, write the summary
+    // to the requested file instead of printing to the console.
+    let mut summary_out: Box<dyn Write> = match summary_output_file {
+        Some(ref path) => Box::new(BufWriter::new(File::create(path)?)),
+        None if is_summary_only => Box::new(io::stdout()),
+        None => Box::new(io::stderr()),
     };
 
-    writeln!(summary_out, "=== Summary ===")?;
+    writeln!(summary_out, "=== whale Summary ===")?;
     writeln!(
         summary_out,
         "Entries Scanned        : {} total ({} files, {} dirs, {} symlinks, {} errors)",
@@ -117,6 +130,7 @@ fn main() -> io::Result<()> {
         "Aggregate Tree SHA-256 : {}",
         root_all_sha256
     )?;
+    summary_out.flush()?;
 
     Ok(())
 }

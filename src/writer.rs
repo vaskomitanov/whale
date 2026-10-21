@@ -1,10 +1,11 @@
-//! `writer.rs` — Dedicated 8 MiB buffered output thread for lock-free TSV and JSONL serialization.
+//! `writer.rs` — Dedicated 8 MiB buffered output dispatcher for TSV, JSONL, and Apache Parquet.
 
 use std::io::{self, BufWriter, Write};
 use crossbeam_channel::Receiver;
 
-use crate::config::OutputFormat;
+use crate::config::{OutputFormat, ParquetCompression};
 use crate::model::ScanRecord;
+use crate::parquet_writer::run_parquet_writer_loop;
 
 /// Formats a 32-byte digest into a 64-byte stack-allocated lowercase hex buffer.
 #[inline]
@@ -50,13 +51,19 @@ pub fn write_json_escaped(out: &mut impl Write, s: &str) -> io::Result<()> {
     out.write_all(b"\"")
 }
 
-/// Dedicated single-consumer buffered writer loop that formats batches of `ScanRecord`s
-/// with zero heap allocation for octal mode, hex, and integer formatting.
+/// Dedicated single-consumer buffered writer loop that dispatches to Apache Parquet or
+/// formats batches of `ScanRecord`s as TSV / JSONL with zero heap allocation.
 pub fn run_writer_loop(
     rx: Receiver<Vec<ScanRecord>>,
     mut writer: BufWriter<Box<dyn Write + Send>>,
     format: OutputFormat,
+    parquet_compression: ParquetCompression,
+    parquet_row_group_size: usize,
 ) -> io::Result<()> {
+    if format == OutputFormat::Parquet {
+        return run_parquet_writer_loop(rx, writer, parquet_compression, parquet_row_group_size);
+    }
+
     if format == OutputFormat::Tsv {
         writer.write_all(
             b"# KIND\tMODE_OCTAL\tMODE_SHA256\tNAME_SHA256\tCONTENT_OR_TARGET_SHA256\tCOMPOSITE_SHA256\tSIZE_BYTES\tPATH\tSYMLINK_TARGET\n",
@@ -128,7 +135,7 @@ pub fn run_writer_loop(
                     }
                     writer.write_all(b"}\n")?;
                 }
-                OutputFormat::Summary => {}
+                OutputFormat::Parquet | OutputFormat::Summary => {}
             }
         }
     }
