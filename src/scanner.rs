@@ -28,7 +28,7 @@ pub struct ScannerContext {
     pub root_base: PathBuf,
     pub telemetry: ScanTelemetry,
     pub tx: Option<Sender<Vec<ScanRecord>>>,
-    /// Present when running in `--compare <PARQUET_FILE>` mode for on-the-fly O(1) diff evaluation.
+    /// Present when running in `whale compare` mode for on-the-fly O(1) diff evaluation.
     pub baseline_index: Option<ShardedBaselineIndex>,
     pub diff_tx: Option<Sender<Vec<DiffRecord>>>,
 }
@@ -112,9 +112,9 @@ fn relative_path<'a>(path: &'a Path, root_base: &Path) -> &'a Path {
     path.strip_prefix(root_base).unwrap_or(path)
 }
 
-/// Processes a single regular file entry (content SHA-256, filename SHA-256, and file mode SHA-256).
+/// Processes a single regular file entry and emits `ScanRecord::File`.
 pub fn process_file(ctx: &ScannerContext, path: PathBuf) {
-    let (content_sha256, actual_size, mode) = match hash_file_contents_and_mode(
+    let (content_sha256, size_bytes, mode) = match hash_file_contents_and_mode(
         &path,
         ctx.config.mmap_threshold,
         ctx.config.permission_bits_only,
@@ -140,26 +140,24 @@ pub fn process_file(ctx: &ScannerContext, path: PathBuf) {
         ctx.config.include_mode,
     );
 
-    ctx.emit_record(ScanRecord {
-        kind: EntryKind::File,
-        mode,
-        mode_sha256,
-        name_sha256,
-        payload_sha256: content_sha256,
-        composite_sha256,
-        size_bytes: actual_size,
+    ctx.emit_record(ScanRecord::File {
         path: if rel.as_os_str().is_empty() {
             path
         } else {
             rel.to_path_buf()
         },
-        symlink_target: None,
+        size_bytes,
+        mode,
+        mode_sha256,
+        name_sha256,
+        content_sha256,
+        composite_sha256,
     });
 }
 
-/// Processes a single symbolic link entry (hashes symlink name, target path, and symlink mode).
+/// Processes a single symbolic link entry and emits `ScanRecord::Symlink`.
 pub fn process_symlink(ctx: &ScannerContext, path: PathBuf) {
-    let target = match fs::read_link(&path) {
+    let symlink_target = match fs::read_link(&path) {
         Ok(t) => t,
         Err(e) => {
             ctx.log_error(&path, &e);
@@ -181,9 +179,7 @@ pub fn process_symlink(ctx: &ScannerContext, path: PathBuf) {
 
     let name_os = path.file_name().unwrap_or_else(|| path.as_os_str());
     let name_sha256 = hash_os_str(name_os);
-    let target_os = target.as_os_str();
-    let target_sha256 = hash_os_str(target_os);
-    let target_len = target_os.as_encoded_bytes().len() as u64;
+    let target_sha256 = hash_os_str(symlink_target.as_os_str());
     let rel = relative_path(&path, &ctx.root_base);
 
     let composite_sha256 = compute_composite_sha256(
@@ -196,25 +192,23 @@ pub fn process_symlink(ctx: &ScannerContext, path: PathBuf) {
         ctx.config.include_mode,
     );
 
-    ctx.emit_record(ScanRecord {
-        kind: EntryKind::Symlink,
-        mode,
-        mode_sha256,
-        name_sha256,
-        payload_sha256: target_sha256,
-        composite_sha256,
-        size_bytes: target_len,
+    ctx.emit_record(ScanRecord::Symlink {
         path: if rel.as_os_str().is_empty() {
             path
         } else {
             rel.to_path_buf()
         },
-        symlink_target: Some(target),
+        symlink_target,
+        mode,
+        mode_sha256,
+        name_sha256,
+        target_sha256,
+        composite_sha256,
     });
 }
 
-/// Processes a directory entry's own name, mode, and relative path hash, then dispatches all
-/// children into Rayon's work-stealing FIFO queue.
+/// Processes a directory entry, emits `ScanRecord::Directory`, and dispatches all children
+/// into Rayon's work-stealing FIFO queue after closing the OS directory descriptor.
 pub fn process_directory<'scope>(
     ctx: &'scope ScannerContext,
     scope: &ScopeFifo<'scope>,
@@ -240,27 +234,24 @@ pub fn process_directory<'scope>(
     } else {
         rel
     };
-    let rel_path_sha256 = hash_os_str(rel_display.as_os_str());
+    let path_sha256 = hash_os_str(rel_display.as_os_str());
     let composite_sha256 = compute_composite_sha256(
         EntryKind::Directory,
         mode,
         rel_display,
         &name_sha256,
-        &rel_path_sha256,
+        &path_sha256,
         ctx.config.include_relative_path,
         ctx.config.include_mode,
     );
 
-    ctx.emit_record(ScanRecord {
-        kind: EntryKind::Directory,
+    ctx.emit_record(ScanRecord::Directory {
+        path: rel_display.to_path_buf(),
         mode,
         mode_sha256,
         name_sha256,
-        payload_sha256: rel_path_sha256,
+        path_sha256,
         composite_sha256,
-        size_bytes: 0,
-        path: rel_display.to_path_buf(),
-        symlink_target: None,
     });
 
     // 3. Read directory entries and immediately close the OS directory handle (`ReadDir`)

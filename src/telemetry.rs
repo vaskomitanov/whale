@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
-use crate::model::{DiffStatus, EntryKind, ScanRecord};
+use crate::model::{DiffStatus, ScanRecord};
 
 /// Lock-free atomic telemetry and order-independent 256-bit multiset accumulators.
 pub struct ScanTelemetry {
@@ -12,7 +12,7 @@ pub struct ScanTelemetry {
     pub symlinks_count: AtomicU64,
     pub errors_count: AtomicU64,
     pub total_file_bytes: AtomicU64,
-    /// Diff counters populated when running in `--compare` or `--compare-snapshots` mode.
+    /// Diff counters populated when running in `whale compare` or `whale compare-snapshots` mode.
     pub baseline_loaded_count: AtomicU64,
     pub unchanged_count: AtomicU64,
     pub added_count: AtomicU64,
@@ -98,27 +98,43 @@ impl ScanTelemetry {
         hasher.finalize().into()
     }
 
-    /// Records a single entry's metrics and folds its digests into the respective accumulators.
+    /// Records a single `ScanRecord` enum variant's metrics and folds its digests into the accumulators.
     #[inline]
     pub fn record_entry(&self, record: &ScanRecord) {
-        Self::fold_digest(&self.multiset_hash, &record.composite_sha256);
-        match record.kind {
-            EntryKind::File => {
+        match record {
+            ScanRecord::Directory {
+                mode_sha256,
+                name_sha256,
+                composite_sha256,
+                ..
+            } => {
+                Self::fold_digest(&self.multiset_hash, composite_sha256);
+                self.dirs_count.fetch_add(1, Ordering::Relaxed);
+                Self::fold_digest(&self.dir_name_multiset, name_sha256);
+                Self::fold_digest(&self.dir_mode_multiset, mode_sha256);
+            }
+            ScanRecord::Symlink {
+                composite_sha256, ..
+            } => {
+                Self::fold_digest(&self.multiset_hash, composite_sha256);
+                self.symlinks_count.fetch_add(1, Ordering::Relaxed);
+                Self::fold_digest(&self.symlink_multiset, composite_sha256);
+            }
+            ScanRecord::File {
+                size_bytes,
+                mode_sha256,
+                name_sha256,
+                content_sha256,
+                composite_sha256,
+                ..
+            } => {
+                Self::fold_digest(&self.multiset_hash, composite_sha256);
                 self.files_count.fetch_add(1, Ordering::Relaxed);
                 self.total_file_bytes
-                    .fetch_add(record.size_bytes, Ordering::Relaxed);
-                Self::fold_digest(&self.file_content_multiset, &record.payload_sha256);
-                Self::fold_digest(&self.file_name_multiset, &record.name_sha256);
-                Self::fold_digest(&self.file_mode_multiset, &record.mode_sha256);
-            }
-            EntryKind::Directory => {
-                self.dirs_count.fetch_add(1, Ordering::Relaxed);
-                Self::fold_digest(&self.dir_name_multiset, &record.name_sha256);
-                Self::fold_digest(&self.dir_mode_multiset, &record.mode_sha256);
-            }
-            EntryKind::Symlink => {
-                self.symlinks_count.fetch_add(1, Ordering::Relaxed);
-                Self::fold_digest(&self.symlink_multiset, &record.composite_sha256);
+                    .fetch_add(*size_bytes, Ordering::Relaxed);
+                Self::fold_digest(&self.file_content_multiset, content_sha256);
+                Self::fold_digest(&self.file_name_multiset, name_sha256);
+                Self::fold_digest(&self.file_mode_multiset, mode_sha256);
             }
         }
     }

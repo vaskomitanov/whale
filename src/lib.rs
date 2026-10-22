@@ -1,4 +1,4 @@
-//! `lib.rs` — Library root orchestrating the `whale` parallel SHA-256 directory scanner and Parquet diff engine.
+//! `lib.rs` — Library root orchestrating the `whale` parallel SHA-256 directory scanner and Delta Lake diff engine.
 
 pub mod config;
 pub mod diff;
@@ -9,14 +9,14 @@ pub mod scanner;
 pub mod telemetry;
 pub mod writer;
 
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossbeam_channel::bounded;
 
-use crate::config::{CliConfig, OutputFormat, CHANNEL_CAPACITY, WRITER_BUF_CAPACITY};
+use crate::config::{CliConfig, OutputFormat, CHANNEL_CAPACITY};
 use crate::diff::{
     flush_all_diff_batches, load_baseline_parquet, run_diff_writer_loop,
     stream_new_parquet_against_baseline,
@@ -29,26 +29,29 @@ use crate::scanner::{
 use crate::telemetry::ScanTelemetry;
 use crate::writer::run_writer_loop;
 
-/// Resolves the target output file path for per-record formats (`tsv`, `jsonl`, `parquet`).
-/// When `--format parquet` is chosen without `--output`, defaults to `"whale_diff.parquet"`
-/// in comparison modes or `"whale_output.parquet"` in scan mode.
+/// Resolves the target output path for per-record formats (`tsv`, `jsonl`, `parquet` / `delta`).
+/// When `--summary-only` is set, returns `None` (since `-o` is used for the summary report).
+/// When `--format parquet` is chosen without `--output`, defaults to `"whale_diff.delta"`
+/// in comparison modes or `"whale_output.delta"` in scan mode.
 #[inline]
 pub fn resolve_record_output_path(config: &CliConfig) -> Option<PathBuf> {
-    if let Some(ref path) = config.output {
+    if config.summary_only {
+        None
+    } else if let Some(ref path) = config.output {
         Some(path.clone())
     } else if config.format == OutputFormat::Parquet {
         if config.is_diff_mode() {
-            Some(PathBuf::from("whale_diff.parquet"))
+            Some(PathBuf::from("whale_diff.delta"))
         } else {
-            Some(PathBuf::from("whale_output.parquet"))
+            Some(PathBuf::from("whale_output.delta"))
         }
     } else {
         None
     }
 }
 
-/// Runs a full parallel scan, live-vs-Parquet comparison (`--compare`), or direct
-/// snapshot-vs-snapshot comparison (`--compare-snapshots`) and returns `ScanTelemetry`.
+/// Runs a full parallel scan (`whale scan`), live-vs-Delta comparison (`whale compare`),
+/// or direct Delta-snapshot-vs-Delta-snapshot comparison (`whale compare-snapshots`) and returns `ScanTelemetry`.
 pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
     maximize_file_descriptor_limit();
 
@@ -61,15 +64,19 @@ pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
     let is_diff_mode = config.is_diff_mode();
     let telemetry = ScanTelemetry::default();
 
-    let baseline_parquet_path = if let Some(ref snapshots) = config.compare_snapshots {
+    let baseline_delta_path = if let Some(ref snapshots) = config.compare_snapshots {
         Some(snapshots[0].clone())
     } else {
         config.compare.clone()
     };
 
-    // Load baseline Parquet index in parallel across row groups if in `--compare` or `--compare-snapshots` mode
-    let baseline_index = match baseline_parquet_path {
-        Some(ref parquet_path) => Some(load_baseline_parquet(parquet_path, &telemetry)?),
+    // Load baseline Delta Lake namespaces (`directories`, `symlinks`, `files`) in parallel across row groups
+    let baseline_index = match baseline_delta_path {
+        Some(ref delta_path) => Some(load_baseline_parquet(
+            delta_path,
+            config.baseline_version,
+            &telemetry,
+        )?),
         None => None,
     };
 
@@ -78,19 +85,14 @@ pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
     let parquet_compression = config.parquet_compression;
     let parquet_row_group_size = config.parquet_row_group_size;
 
-    let (tx, diff_tx, writer_handle) = if format == OutputFormat::Summary {
+    let (tx, diff_tx, writer_handle) = if config.summary_only {
         (None, None, None)
     } else if is_diff_mode {
         let (d_tx, d_rx) = bounded::<Vec<DiffRecord>>(CHANNEL_CAPACITY);
-        let sink: Box<dyn Write + Send> = match record_output_path {
-            Some(ref p) => Box::new(File::create(p)?),
-            None => Box::new(io::stdout()),
-        };
-        let buf_writer = BufWriter::with_capacity(WRITER_BUF_CAPACITY, sink);
         let handle = std::thread::spawn(move || {
             run_diff_writer_loop(
                 d_rx,
-                buf_writer,
+                record_output_path,
                 format,
                 parquet_compression,
                 parquet_row_group_size,
@@ -99,15 +101,10 @@ pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
         (None, Some(d_tx), Some(handle))
     } else {
         let (s_tx, s_rx) = bounded::<Vec<ScanRecord>>(CHANNEL_CAPACITY);
-        let sink: Box<dyn Write + Send> = match record_output_path {
-            Some(ref p) => Box::new(File::create(p)?),
-            None => Box::new(io::stdout()),
-        };
-        let buf_writer = BufWriter::with_capacity(WRITER_BUF_CAPACITY, sink);
         let handle = std::thread::spawn(move || {
             run_writer_loop(
                 s_rx,
-                buf_writer,
+                record_output_path,
                 format,
                 parquet_compression,
                 parquet_row_group_size,
@@ -116,14 +113,20 @@ pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
         (Some(s_tx), None, Some(handle))
     };
 
-    // Branch 1: Direct Parquet-to-Parquet snapshot comparison (`--compare-snapshots <OLD> <NEW>`)
+    // Branch 1: Direct Delta-snapshot-to-Delta-snapshot comparison (`whale compare-snapshots`)
     if let Some(ref snapshots) = config.compare_snapshots {
-        let new_parquet_path = &snapshots[1];
+        let new_delta_path = &snapshots[1];
         let baseline = baseline_index
             .as_ref()
             .expect("baseline_index initialized for compare_snapshots");
 
-        stream_new_parquet_against_baseline(new_parquet_path, baseline, &telemetry, &diff_tx)?;
+        stream_new_parquet_against_baseline(
+            new_delta_path,
+            config.target_version,
+            baseline,
+            &telemetry,
+            &diff_tx,
+        )?;
         baseline.drain_deleted_parallel(&telemetry, &diff_tx);
 
         if let Some(ref d_sender) = diff_tx {
@@ -137,7 +140,7 @@ pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
         return Ok(telemetry);
     }
 
-    // Branch 2: Live filesystem scan (standalone or `--compare <BASELINE.parquet>`)
+    // Branch 2: Live filesystem scan (`whale scan` or `whale compare <BASELINE_DELTA> <DIR>`)
     let root_path = config.root.clone();
     let root_meta = fs::symlink_metadata(&root_path)?;
 
@@ -191,12 +194,14 @@ pub fn execute_scan(config: CliConfig) -> io::Result<ScanTelemetry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ParquetCompression, DEFAULT_PARQUET_ROW_GROUP_SIZE};
+    use crate::config::{Cli, CommonOptions};
+    use crate::parquet_writer::DeltaNamespacePaths;
+    use clap::Parser;
     use std::sync::atomic::Ordering;
 
     #[test]
-    fn test_live_and_snapshot_to_snapshot_parquet_comparison() -> io::Result<()> {
-        let tmp = std::env::temp_dir().join("whale_snapshot_diff_test");
+    fn test_delta_rs_namespaces_and_parallel_comparison() -> io::Result<()> {
+        let tmp = std::env::temp_dir().join("whale_delta_namespaces_test");
         let _ = fs::remove_dir_all(&tmp);
         let scan_root = tmp.join("workspace");
         fs::create_dir_all(scan_root.join("dir_keep"))?;
@@ -210,73 +215,70 @@ mod tests {
         fs::write(&file_modified, b"version 1")?;
         fs::write(&file_deleted, b"to be deleted")?;
 
-        let snap_v1 = tmp.join("snap_v1.parquet");
-        let snap_v2 = tmp.join("snap_v2.parquet");
+        let snap_v1 = tmp.join("snap_v1.delta");
+        let snap_v2 = tmp.join("snap_v2.delta");
 
-        // 1. Index v1 into snap_v1.parquet
-        let cfg_v1 = CliConfig {
-            root: scan_root.clone(),
-            compare: None,
-            compare_snapshots: None,
-            format: OutputFormat::Parquet,
-            output: Some(snap_v1.clone()),
-            skip_summary: true,
-            threads: 4,
-            mmap_threshold: 256 * 1024,
-            include_relative_path: true,
-            include_mode: true,
-            permission_bits_only: false,
-            parquet_compression: ParquetCompression::Zstd,
-            parquet_row_group_size: DEFAULT_PARQUET_ROW_GROUP_SIZE,
-        };
-        execute_scan(cfg_v1)?;
+        // 1. Scan v1 into a Delta Lake repository with `directories`, `symlinks`, and `files` namespaces
+        let cli_scan = Cli::parse_from([
+            "whale",
+            "scan",
+            scan_root.to_str().unwrap(),
+            "--format",
+            "parquet",
+            "-o",
+            snap_v1.to_str().unwrap(),
+            "--skip-summary",
+        ]);
+        execute_scan(cli_scan.into_config())?;
 
-        // 2. Mutate filesystem and index v2 into snap_v2.parquet
+        let v1_ns = DeltaNamespacePaths::from_base_path(&snap_v1);
+        assert!(v1_ns.directories_ns.join("_delta_log").is_dir());
+        assert!(v1_ns.symlinks_ns.join("_delta_log").is_dir());
+        assert!(v1_ns.files_ns.join("_delta_log").is_dir());
+
+        // 2. Mutate filesystem and compare against the v1 Delta Lake namespaces
         fs::write(&file_modified, b"version 2 - updated content")?;
         fs::remove_dir_all(scan_root.join("dir_to_delete"))?;
         fs::write(scan_root.join("dir_keep/added.txt"), b"brand new file")?;
 
-        let cfg_v2 = CliConfig {
-            root: scan_root.clone(),
-            compare: None,
-            compare_snapshots: None,
+        let cli_compare_summary = Cli::parse_from([
+            "whale",
+            "compare",
+            snap_v1.to_str().unwrap(),
+            scan_root.to_str().unwrap(),
+            "--summary",
+        ]);
+        let t_live_diff = execute_scan(cli_compare_summary.into_config())?;
+        assert_eq!(t_live_diff.added_count.load(Ordering::Relaxed), 1);
+        assert_eq!(t_live_diff.deleted_count.load(Ordering::Relaxed), 2);
+        assert_eq!(t_live_diff.modified_content_count.load(Ordering::Relaxed), 1);
+
+        // 3. Scan v2 into `snap_v2.delta` and compare `snap_v1.delta` vs `snap_v2.delta` directly
+        let common_v2 = CommonOptions {
             format: OutputFormat::Parquet,
             output: Some(snap_v2.clone()),
             skip_summary: true,
-            threads: 4,
-            mmap_threshold: 256 * 1024,
-            include_relative_path: true,
-            include_mode: true,
-            permission_bits_only: false,
-            parquet_compression: ParquetCompression::Zstd,
-            parquet_row_group_size: DEFAULT_PARQUET_ROW_GROUP_SIZE,
+            ..Default::default()
         };
-        execute_scan(cfg_v2)?;
+        execute_scan(CliConfig::from_scan(scan_root.clone(), common_v2))?;
 
-        // 3. Compare snap_v1.parquet and snap_v2.parquet directly without touching the filesystem
-        let diff_out = tmp.join("snap_diffs.parquet");
-        let cfg_snap_diff = CliConfig {
-            root: PathBuf::from("."),
-            compare: None,
-            compare_snapshots: Some(vec![snap_v1, snap_v2]),
-            format: OutputFormat::Parquet,
-            output: Some(diff_out.clone()),
-            skip_summary: true,
-            threads: 4,
-            mmap_threshold: 256 * 1024,
-            include_relative_path: true,
-            include_mode: true,
-            permission_bits_only: false,
-            parquet_compression: ParquetCompression::Zstd,
-            parquet_row_group_size: DEFAULT_PARQUET_ROW_GROUP_SIZE,
-        };
-
-        let t_diff = execute_scan(cfg_snap_diff)?;
-        assert_eq!(t_diff.added_count.load(Ordering::Relaxed), 1);
-        assert_eq!(t_diff.deleted_count.load(Ordering::Relaxed), 2);
-        assert_eq!(t_diff.modified_content_count.load(Ordering::Relaxed), 1);
-        assert_eq!(t_diff.unchanged_count.load(Ordering::Relaxed), 3);
-        assert!(diff_out.exists());
+        let snap_diff_out = tmp.join("snap_diffs.delta");
+        let cli_compare_snaps = Cli::parse_from([
+            "whale",
+            "compare",
+            snap_v1.to_str().unwrap(),
+            snap_v2.to_str().unwrap(),
+            "--format",
+            "parquet",
+            "-o",
+            snap_diff_out.to_str().unwrap(),
+            "--skip-summary",
+        ]);
+        let t_snap_diff = execute_scan(cli_compare_snaps.into_config())?;
+        assert_eq!(t_snap_diff.added_count.load(Ordering::Relaxed), 1);
+        assert_eq!(t_snap_diff.deleted_count.load(Ordering::Relaxed), 2);
+        assert_eq!(t_snap_diff.modified_content_count.load(Ordering::Relaxed), 1);
+        assert!(snap_diff_out.join("diffs").join("_delta_log").is_dir());
 
         let _ = fs::remove_dir_all(&tmp);
         Ok(())

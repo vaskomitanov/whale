@@ -1,9 +1,11 @@
 //! `writer.rs` — Dedicated 8 MiB buffered output dispatcher for TSV, JSONL, and Apache Parquet.
 
+use std::fs::File;
 use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
 use crossbeam_channel::Receiver;
 
-use crate::config::{OutputFormat, ParquetCompression};
+use crate::config::{OutputFormat, ParquetCompression, WRITER_BUF_CAPACITY};
 use crate::model::ScanRecord;
 use crate::parquet_writer::run_parquet_writer_loop;
 
@@ -51,22 +53,30 @@ pub fn write_json_escaped(out: &mut impl Write, s: &str) -> io::Result<()> {
     out.write_all(b"\"")
 }
 
-/// Dedicated single-consumer buffered writer loop that dispatches to Apache Parquet or
-/// formats batches of `ScanRecord`s as TSV / JSONL with zero heap allocation.
+/// Dedicated single-consumer buffered writer loop that dispatches `OutputFormat::Parquet` to the
+/// three-schema Parquet writer (`Directory`, `Symlink`, `File`) or formats `ScanRecord` enum
+/// variants as TSV / JSONL with zero heap allocation.
 pub fn run_writer_loop(
     rx: Receiver<Vec<ScanRecord>>,
-    mut writer: BufWriter<Box<dyn Write + Send>>,
+    record_output_path: Option<PathBuf>,
     format: OutputFormat,
     parquet_compression: ParquetCompression,
     parquet_row_group_size: usize,
 ) -> io::Result<()> {
     if format == OutputFormat::Parquet {
-        return run_parquet_writer_loop(rx, writer, parquet_compression, parquet_row_group_size);
+        let base_path = record_output_path.unwrap_or_else(|| PathBuf::from("whale_output.parquet"));
+        return run_parquet_writer_loop(rx, &base_path, parquet_compression, parquet_row_group_size);
     }
+
+    let sink: Box<dyn Write + Send> = match record_output_path {
+        Some(ref p) => Box::new(File::create(p)?),
+        None => Box::new(io::stdout()),
+    };
+    let mut writer = BufWriter::with_capacity(WRITER_BUF_CAPACITY, sink);
 
     if format == OutputFormat::Tsv {
         writer.write_all(
-            b"# KIND\tMODE_OCTAL\tMODE_SHA256\tNAME_SHA256\tCONTENT_OR_TARGET_SHA256\tCOMPOSITE_SHA256\tSIZE_BYTES\tPATH\tSYMLINK_TARGET\n",
+            b"# KIND\tMODE_OCTAL\tMODE_SHA256\tNAME_SHA256\tPAYLOAD_SHA256\tCOMPOSITE_SHA256\tSIZE_BYTES\tPATH\tSYMLINK_TARGET\n",
         )?;
     }
 
@@ -79,63 +89,167 @@ pub fn run_writer_loop(
 
     for batch in rx {
         for rec in batch {
-            format_octal_mode(rec.mode, &mut mode_octal);
-            encode_hex_64(&rec.mode_sha256, &mut mode_hex);
-            encode_hex_64(&rec.name_sha256, &mut name_hex);
-            encode_hex_64(&rec.payload_sha256, &mut payload_hex);
-            encode_hex_64(&rec.composite_sha256, &mut comp_hex);
+            match rec {
+                ScanRecord::Directory {
+                    ref path,
+                    mode,
+                    ref mode_sha256,
+                    ref name_sha256,
+                    ref path_sha256,
+                    ref composite_sha256,
+                } => {
+                    format_octal_mode(mode, &mut mode_octal);
+                    encode_hex_64(mode_sha256, &mut mode_hex);
+                    encode_hex_64(name_sha256, &mut name_hex);
+                    encode_hex_64(path_sha256, &mut payload_hex);
+                    encode_hex_64(composite_sha256, &mut comp_hex);
 
-            match format {
-                OutputFormat::Tsv => {
-                    writer.write_all(rec.kind.as_str().as_bytes())?;
-                    writer.write_all(b"\t")?;
-                    writer.write_all(&mode_octal)?;
-                    writer.write_all(b"\t")?;
-                    writer.write_all(&mode_hex)?;
-                    writer.write_all(b"\t")?;
-                    writer.write_all(&name_hex)?;
-                    writer.write_all(b"\t")?;
-                    writer.write_all(&payload_hex)?;
-                    writer.write_all(b"\t")?;
-                    writer.write_all(&comp_hex)?;
-                    writer.write_all(b"\t")?;
-                    writer.write_all(int_buf.format(rec.size_bytes).as_bytes())?;
-                    writer.write_all(b"\t")?;
-                    writer.write_all(rec.path.to_string_lossy().as_bytes())?;
-                    writer.write_all(b"\t")?;
-                    if let Some(ref target) = rec.symlink_target {
-                        writer.write_all(target.to_string_lossy().as_bytes())?;
-                    } else {
-                        writer.write_all(b"-")?;
+                    match format {
+                        OutputFormat::Tsv => {
+                            writer.write_all(b"DIR\t")?;
+                            writer.write_all(&mode_octal)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&mode_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&name_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&payload_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&comp_hex)?;
+                            writer.write_all(b"\t-\t")?;
+                            writer.write_all(path.to_string_lossy().as_bytes())?;
+                            writer.write_all(b"\t-\n")?;
+                        }
+                        OutputFormat::Jsonl => {
+                            writer.write_all(b"{\"kind\":\"DIR\",\"mode_octal\":\"")?;
+                            writer.write_all(&mode_octal)?;
+                            writer.write_all(b"\",\"mode\":")?;
+                            writer.write_all(int_buf.format(mode).as_bytes())?;
+                            writer.write_all(b",\"mode_sha256\":\"")?;
+                            writer.write_all(&mode_hex)?;
+                            writer.write_all(b"\",\"name_sha256\":\"")?;
+                            writer.write_all(&name_hex)?;
+                            writer.write_all(b"\",\"path_sha256\":\"")?;
+                            writer.write_all(&payload_hex)?;
+                            writer.write_all(b"\",\"composite_sha256\":\"")?;
+                            writer.write_all(&comp_hex)?;
+                            writer.write_all(b"\",\"path\":")?;
+                            write_json_escaped(&mut writer, &path.to_string_lossy())?;
+                            writer.write_all(b"}\n")?;
+                        }
+                        OutputFormat::Parquet => {}
                     }
-                    writer.write_all(b"\n")?;
                 }
-                OutputFormat::Jsonl => {
-                    writer.write_all(b"{\"kind\":\"")?;
-                    writer.write_all(rec.kind.as_str().as_bytes())?;
-                    writer.write_all(b"\",\"mode_octal\":\"")?;
-                    writer.write_all(&mode_octal)?;
-                    writer.write_all(b"\",\"mode\":")?;
-                    writer.write_all(int_buf.format(rec.mode).as_bytes())?;
-                    writer.write_all(b",\"mode_sha256\":\"")?;
-                    writer.write_all(&mode_hex)?;
-                    writer.write_all(b"\",\"name_sha256\":\"")?;
-                    writer.write_all(&name_hex)?;
-                    writer.write_all(b"\",\"payload_sha256\":\"")?;
-                    writer.write_all(&payload_hex)?;
-                    writer.write_all(b"\",\"composite_sha256\":\"")?;
-                    writer.write_all(&comp_hex)?;
-                    writer.write_all(b"\",\"size_bytes\":")?;
-                    writer.write_all(int_buf.format(rec.size_bytes).as_bytes())?;
-                    writer.write_all(b",\"path\":")?;
-                    write_json_escaped(&mut writer, &rec.path.to_string_lossy())?;
-                    if let Some(ref target) = rec.symlink_target {
-                        writer.write_all(b",\"symlink_target\":")?;
-                        write_json_escaped(&mut writer, &target.to_string_lossy())?;
+                ScanRecord::Symlink {
+                    ref path,
+                    ref symlink_target,
+                    mode,
+                    ref mode_sha256,
+                    ref name_sha256,
+                    ref target_sha256,
+                    ref composite_sha256,
+                } => {
+                    format_octal_mode(mode, &mut mode_octal);
+                    encode_hex_64(mode_sha256, &mut mode_hex);
+                    encode_hex_64(name_sha256, &mut name_hex);
+                    encode_hex_64(target_sha256, &mut payload_hex);
+                    encode_hex_64(composite_sha256, &mut comp_hex);
+
+                    match format {
+                        OutputFormat::Tsv => {
+                            writer.write_all(b"SYMLINK\t")?;
+                            writer.write_all(&mode_octal)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&mode_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&name_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&payload_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&comp_hex)?;
+                            writer.write_all(b"\t-\t")?;
+                            writer.write_all(path.to_string_lossy().as_bytes())?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(symlink_target.to_string_lossy().as_bytes())?;
+                            writer.write_all(b"\n")?;
+                        }
+                        OutputFormat::Jsonl => {
+                            writer.write_all(b"{\"kind\":\"SYMLINK\",\"mode_octal\":\"")?;
+                            writer.write_all(&mode_octal)?;
+                            writer.write_all(b"\",\"mode\":")?;
+                            writer.write_all(int_buf.format(mode).as_bytes())?;
+                            writer.write_all(b",\"mode_sha256\":\"")?;
+                            writer.write_all(&mode_hex)?;
+                            writer.write_all(b"\",\"name_sha256\":\"")?;
+                            writer.write_all(&name_hex)?;
+                            writer.write_all(b"\",\"target_sha256\":\"")?;
+                            writer.write_all(&payload_hex)?;
+                            writer.write_all(b"\",\"composite_sha256\":\"")?;
+                            writer.write_all(&comp_hex)?;
+                            writer.write_all(b"\",\"path\":")?;
+                            write_json_escaped(&mut writer, &path.to_string_lossy())?;
+                            writer.write_all(b",\"symlink_target\":")?;
+                            write_json_escaped(&mut writer, &symlink_target.to_string_lossy())?;
+                            writer.write_all(b"}\n")?;
+                        }
+                        OutputFormat::Parquet => {}
                     }
-                    writer.write_all(b"}\n")?;
                 }
-                OutputFormat::Parquet | OutputFormat::Summary => {}
+                ScanRecord::File {
+                    ref path,
+                    size_bytes,
+                    mode,
+                    ref mode_sha256,
+                    ref name_sha256,
+                    ref content_sha256,
+                    ref composite_sha256,
+                } => {
+                    format_octal_mode(mode, &mut mode_octal);
+                    encode_hex_64(mode_sha256, &mut mode_hex);
+                    encode_hex_64(name_sha256, &mut name_hex);
+                    encode_hex_64(content_sha256, &mut payload_hex);
+                    encode_hex_64(composite_sha256, &mut comp_hex);
+
+                    match format {
+                        OutputFormat::Tsv => {
+                            writer.write_all(b"FILE\t")?;
+                            writer.write_all(&mode_octal)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&mode_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&name_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&payload_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(&comp_hex)?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(int_buf.format(size_bytes).as_bytes())?;
+                            writer.write_all(b"\t")?;
+                            writer.write_all(path.to_string_lossy().as_bytes())?;
+                            writer.write_all(b"\t-\n")?;
+                        }
+                        OutputFormat::Jsonl => {
+                            writer.write_all(b"{\"kind\":\"FILE\",\"mode_octal\":\"")?;
+                            writer.write_all(&mode_octal)?;
+                            writer.write_all(b"\",\"mode\":")?;
+                            writer.write_all(int_buf.format(mode).as_bytes())?;
+                            writer.write_all(b",\"mode_sha256\":\"")?;
+                            writer.write_all(&mode_hex)?;
+                            writer.write_all(b"\",\"name_sha256\":\"")?;
+                            writer.write_all(&name_hex)?;
+                            writer.write_all(b"\",\"content_sha256\":\"")?;
+                            writer.write_all(&payload_hex)?;
+                            writer.write_all(b"\",\"composite_sha256\":\"")?;
+                            writer.write_all(&comp_hex)?;
+                            writer.write_all(b"\",\"size_bytes\":")?;
+                            writer.write_all(int_buf.format(size_bytes).as_bytes())?;
+                            writer.write_all(b",\"path\":")?;
+                            write_json_escaped(&mut writer, &path.to_string_lossy())?;
+                            writer.write_all(b"}\n")?;
+                        }
+                        OutputFormat::Parquet => {}
+                    }
+                }
             }
         }
     }

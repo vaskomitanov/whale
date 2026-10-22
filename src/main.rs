@@ -1,4 +1,4 @@
-//! `main.rs` — Binary entrypoint for `whale`.
+//! `main.rs` — Binary entrypoint for `whale` (`whale scan` and `whale compare` commands).
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -7,14 +7,16 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use whale::config::{CliConfig, OutputFormat};
+use whale::config::Cli;
 use whale::execute_scan;
 use whale::telemetry::ScanTelemetry;
 use whale::writer::format_hex_string;
 
 fn main() -> io::Result<()> {
-    let config = CliConfig::parse();
-    let is_summary_only = config.format == OutputFormat::Summary;
+    let cli = Cli::parse();
+    let config = cli.into_config();
+
+    let is_summary_only = config.summary_only;
     let is_diff_mode = config.is_diff_mode();
     let skip_summary = config.skip_summary;
     let summary_output_file = if is_summary_only {

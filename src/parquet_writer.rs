@@ -1,17 +1,46 @@
-//! `parquet_writer.rs` — Streaming Apache Parquet columnar writer for `whale`.
+//! `parquet_writer.rs` — High-throughput `delta-rs` (`deltalake`) writer grouping `Directory`,
+//! `Symlink`, and `File` records into three separate Delta Lake table namespaces under a single
+//! root repository without sacrificing throughput.
 //!
-//! Accumulates incoming `ScanRecord` batches into pre-allocated columnar builders and flushes
-//! bounded row groups (default 65,536 rows per row group) to disk with ZSTD or Snappy compression.
-//! This keeps memory usage strictly O(row_group_size) even when exporting 50+ million files.
+//! ### Namespace & Schema Architecture
+//! Under a single target Delta root directory (`<root>/`):
+//! 1. **Namespace `directories` (`<root>/directories`)**:
+//!    - Arrow Schema: `build_directory_parquet_schema()`
+//!    - Delta Kernel Schema: `build_directory_delta_fields()`
+//!    - Columns: `path`, `mode_octal`, `mode`, `mode_sha256`, `name_sha256`, `path_sha256`, `composite_sha256`
+//! 2. **Namespace `symlinks` (`<root>/symlinks`)**:
+//!    - Arrow Schema: `build_symlink_parquet_schema()`
+//!    - Delta Kernel Schema: `build_symlink_delta_fields()`
+//!    - Columns: `path`, `symlink_target`, `mode_octal`, `mode`, `mode_sha256`, `name_sha256`, `target_sha256`, `composite_sha256`
+//! 3. **Namespace `files` (`<root>/files`)**:
+//!    - Arrow Schema: `build_file_parquet_schema()`
+//!    - Delta Kernel Schema: `build_file_delta_fields()`
+//!    - Columns: `path`, `size_bytes`, `mode_octal`, `mode`, `mode_sha256`, `name_sha256`, `content_sha256`, `composite_sha256`
+//!
+//! ### How High Performance is Preserved with `delta-rs`:
+//! - **Zero Per-Batch Transaction Log Overhead**: Incoming `ScanRecord` batches are accumulated into
+//!   pre-allocated Arrow columnar builders (`DirectoryColumnarBuffer`, `SymlinkColumnarBuffer`,
+//!   `FileColumnarBuffer`). Whenever a buffer reaches `row_group_size` (65,536 rows),
+//!   `RecordBatchWriter::write` streams a compressed Parquet data file directly into the namespace
+//!   directory without writing to `_delta_log`.
+//! - **Single Concurrent Atomic Commit (`tokio::try_join!`)**: Only after the entire scan finishes do
+//!   the three `RecordBatchWriter` instances call `flush_and_commit(&mut table)` concurrently,
+//!   committing a single atomic `_delta_log` entry per namespace!
 
-use std::io::{self, BufWriter, Write};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::builder::{StringBuilder, UInt32Builder, UInt64Builder};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use crossbeam_channel::Receiver;
-use parquet::arrow::ArrowWriter;
+use deltalake::kernel::{DataType as DeltaDataType, PrimitiveType, StructField};
+use deltalake::operations::create::CreateBuilder;
+use deltalake::protocol::SaveMode;
+use deltalake::writer::{DeltaWriter, RecordBatchWriter};
+use deltalake::DeltaTable;
 use parquet::basic::{Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::schema::types::ColumnPath;
@@ -20,24 +49,118 @@ use crate::config::ParquetCompression;
 use crate::model::ScanRecord;
 use crate::writer::{encode_hex_64, format_octal_mode};
 
-/// Builds the canonical Apache Arrow schema for `whale` Parquet files.
-pub fn build_parquet_schema() -> Arc<Schema> {
+/// 1. Dedicated Apache Arrow / Parquet schema for the **`directories`** Delta namespace (`ScanRecord::Directory`).
+pub fn build_directory_parquet_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("kind", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
         Field::new("mode_octal", DataType::Utf8, false),
         Field::new("mode", DataType::UInt32, false),
         Field::new("mode_sha256", DataType::Utf8, false),
         Field::new("name_sha256", DataType::Utf8, false),
-        Field::new("payload_sha256", DataType::Utf8, false),
+        Field::new("path_sha256", DataType::Utf8, false),
         Field::new("composite_sha256", DataType::Utf8, false),
-        Field::new("size_bytes", DataType::UInt64, false),
-        Field::new("path", DataType::Utf8, false),
-        Field::new("symlink_target", DataType::Utf8, true),
     ]))
 }
 
-/// Configures Apache Parquet `WriterProperties` with dictionary encoding on low-cardinality
-/// columns (`kind`, `mode_octal`, `mode_sha256`) and user-selected page compression.
+/// Delta Lake `StructField` schema definition for the **`directories`** namespace.
+pub fn build_directory_delta_fields() -> Vec<StructField> {
+    vec![
+        StructField::new("path", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("mode_octal", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("mode", DeltaDataType::Primitive(PrimitiveType::Integer), false),
+        StructField::new("mode_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("name_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("path_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("composite_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+    ]
+}
+
+/// 2. Dedicated Apache Arrow / Parquet schema for the **`symlinks`** Delta namespace (`ScanRecord::Symlink`).
+pub fn build_symlink_parquet_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("path", DataType::Utf8, false),
+        Field::new("symlink_target", DataType::Utf8, false),
+        Field::new("mode_octal", DataType::Utf8, false),
+        Field::new("mode", DataType::UInt32, false),
+        Field::new("mode_sha256", DataType::Utf8, false),
+        Field::new("name_sha256", DataType::Utf8, false),
+        Field::new("target_sha256", DataType::Utf8, false),
+        Field::new("composite_sha256", DataType::Utf8, false),
+    ]))
+}
+
+/// Delta Lake `StructField` schema definition for the **`symlinks`** namespace.
+pub fn build_symlink_delta_fields() -> Vec<StructField> {
+    vec![
+        StructField::new("path", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("symlink_target", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("mode_octal", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("mode", DeltaDataType::Primitive(PrimitiveType::Integer), false),
+        StructField::new("mode_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("name_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("target_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("composite_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+    ]
+}
+
+/// 3. Dedicated Apache Arrow / Parquet schema for the **`files`** Delta namespace (`ScanRecord::File`).
+pub fn build_file_parquet_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("path", DataType::Utf8, false),
+        Field::new("size_bytes", DataType::UInt64, false),
+        Field::new("mode_octal", DataType::Utf8, false),
+        Field::new("mode", DataType::UInt32, false),
+        Field::new("mode_sha256", DataType::Utf8, false),
+        Field::new("name_sha256", DataType::Utf8, false),
+        Field::new("content_sha256", DataType::Utf8, false),
+        Field::new("composite_sha256", DataType::Utf8, false),
+    ]))
+}
+
+/// Delta Lake `StructField` schema definition for the **`files`** namespace.
+pub fn build_file_delta_fields() -> Vec<StructField> {
+    vec![
+        StructField::new("path", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("size_bytes", DeltaDataType::Primitive(PrimitiveType::Long), false),
+        StructField::new("mode_octal", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("mode", DeltaDataType::Primitive(PrimitiveType::Integer), false),
+        StructField::new("mode_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("name_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("content_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+        StructField::new("composite_sha256", DeltaDataType::Primitive(PrimitiveType::String), false),
+    ]
+}
+
+/// Groups the three Delta Lake table namespaces (`directories`, `symlinks`, `files`) under a single
+/// root Delta directory (`root_dir`).
+#[derive(Debug, Clone)]
+pub struct DeltaNamespacePaths {
+    pub root_dir: PathBuf,
+    pub directories_ns: PathBuf,
+    pub symlinks_ns: PathBuf,
+    pub files_ns: PathBuf,
+}
+
+impl DeltaNamespacePaths {
+    pub fn from_base_path(base: &Path) -> Self {
+        Self {
+            root_dir: base.to_path_buf(),
+            directories_ns: base.join("directories"),
+            symlinks_ns: base.join("symlinks"),
+            files_ns: base.join("files"),
+        }
+    }
+
+    pub fn ensure_directories_exist(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.directories_ns)?;
+        fs::create_dir_all(&self.symlinks_ns)?;
+        fs::create_dir_all(&self.files_ns)?;
+        Ok(())
+    }
+}
+
+/// Configures Apache Parquet `WriterProperties` for `RecordBatchWriter` with dictionary encoding
+/// on low-cardinality mode columns (`mode_octal`, `mode_sha256`) and user-selected page compression.
 pub fn build_writer_properties(
     compression: ParquetCompression,
     row_group_size: usize,
@@ -56,100 +179,85 @@ pub fn build_writer_properties(
         .set_compression(codec)
         .set_max_row_group_size(row_group_size.max(1024))
         .set_dictionary_enabled(false)
-        .set_column_dictionary_enabled(ColumnPath::from("kind"), true)
         .set_column_dictionary_enabled(ColumnPath::from("mode_octal"), true)
         .set_column_dictionary_enabled(ColumnPath::from("mode_sha256"), true)
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .build()
 }
 
-/// Reusable columnar batch buffer that converts `ScanRecord` items into an Arrow `RecordBatch`.
-struct ColumnarBatchBuffer {
+/// Columnar batch builder for `ScanRecord::Directory` matching `build_directory_parquet_schema()`.
+struct DirectoryColumnarBuffer {
     len: usize,
-    kind_col: StringBuilder,
+    path_col: StringBuilder,
     mode_octal_col: StringBuilder,
     mode_col: UInt32Builder,
     mode_sha256_col: StringBuilder,
     name_sha256_col: StringBuilder,
-    payload_sha256_col: StringBuilder,
+    path_sha256_col: StringBuilder,
     composite_sha256_col: StringBuilder,
-    size_bytes_col: UInt64Builder,
-    path_col: StringBuilder,
-    symlink_target_col: StringBuilder,
 }
 
-impl ColumnarBatchBuffer {
-    fn with_capacity(capacity: usize) -> Self {
+impl DirectoryColumnarBuffer {
+    fn with_capacity(cap: usize) -> Self {
         Self {
             len: 0,
-            kind_col: StringBuilder::with_capacity(capacity, capacity * 5),
-            mode_octal_col: StringBuilder::with_capacity(capacity, capacity * 7),
-            mode_col: UInt32Builder::with_capacity(capacity),
-            mode_sha256_col: StringBuilder::with_capacity(capacity, capacity * 64),
-            name_sha256_col: StringBuilder::with_capacity(capacity, capacity * 64),
-            payload_sha256_col: StringBuilder::with_capacity(capacity, capacity * 64),
-            composite_sha256_col: StringBuilder::with_capacity(capacity, capacity * 64),
-            size_bytes_col: UInt64Builder::with_capacity(capacity),
-            path_col: StringBuilder::with_capacity(capacity, capacity * 48),
-            symlink_target_col: StringBuilder::with_capacity(capacity, capacity * 16),
+            path_col: StringBuilder::with_capacity(cap, cap * 48),
+            mode_octal_col: StringBuilder::with_capacity(cap, cap * 7),
+            mode_col: UInt32Builder::with_capacity(cap),
+            mode_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            name_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            path_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            composite_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
         }
     }
 
     #[inline]
     fn push(
         &mut self,
-        rec: &ScanRecord,
-        mode_octal: &mut [u8; 7],
-        mode_hex: &mut [u8; 64],
-        name_hex: &mut [u8; 64],
-        payload_hex: &mut [u8; 64],
-        comp_hex: &mut [u8; 64],
+        path: &Path,
+        mode: u32,
+        mode_sha256: &[u8; 32],
+        name_sha256: &[u8; 32],
+        path_sha256: &[u8; 32],
+        composite_sha256: &[u8; 32],
+        octal_buf: &mut [u8; 7],
+        hex_buf: &mut [u8; 64],
     ) {
-        format_octal_mode(rec.mode, mode_octal);
-        encode_hex_64(&rec.mode_sha256, mode_hex);
-        encode_hex_64(&rec.name_sha256, name_hex);
-        encode_hex_64(&rec.payload_sha256, payload_hex);
-        encode_hex_64(&rec.composite_sha256, comp_hex);
+        self.path_col.append_value(path.to_string_lossy().as_ref());
 
-        // SAFETY: `format_octal_mode` and `encode_hex_64` only write ASCII hex/octal digits (`0..=9`, `a..=f`).
-        let octal_str = unsafe { std::str::from_utf8_unchecked(mode_octal) };
-        let mode_hex_str = unsafe { std::str::from_utf8_unchecked(mode_hex) };
-        let name_hex_str = unsafe { std::str::from_utf8_unchecked(name_hex) };
-        let payload_hex_str = unsafe { std::str::from_utf8_unchecked(payload_hex) };
-        let comp_hex_str = unsafe { std::str::from_utf8_unchecked(comp_hex) };
+        format_octal_mode(mode, octal_buf);
+        self.mode_octal_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(octal_buf) });
+        self.mode_col.append_value(mode);
 
-        self.kind_col.append_value(rec.kind.as_str());
-        self.mode_octal_col.append_value(octal_str);
-        self.mode_col.append_value(rec.mode);
-        self.mode_sha256_col.append_value(mode_hex_str);
-        self.name_sha256_col.append_value(name_hex_str);
-        self.payload_sha256_col.append_value(payload_hex_str);
-        self.composite_sha256_col.append_value(comp_hex_str);
-        self.size_bytes_col.append_value(rec.size_bytes);
-        self.path_col.append_value(rec.path.to_string_lossy().as_ref());
+        encode_hex_64(mode_sha256, hex_buf);
+        self.mode_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
 
-        match rec.symlink_target {
-            Some(ref target) => self
-                .symlink_target_col
-                .append_value(target.to_string_lossy().as_ref()),
-            None => self.symlink_target_col.append_null(),
-        }
+        encode_hex_64(name_sha256, hex_buf);
+        self.name_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        encode_hex_64(path_sha256, hex_buf);
+        self.path_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        encode_hex_64(composite_sha256, hex_buf);
+        self.composite_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
 
         self.len += 1;
     }
 
     fn flush_batch(&mut self, schema: &Arc<Schema>) -> io::Result<RecordBatch> {
         let columns: Vec<ArrayRef> = vec![
-            Arc::new(self.kind_col.finish()),
+            Arc::new(self.path_col.finish()),
             Arc::new(self.mode_octal_col.finish()),
             Arc::new(self.mode_col.finish()),
             Arc::new(self.mode_sha256_col.finish()),
             Arc::new(self.name_sha256_col.finish()),
-            Arc::new(self.payload_sha256_col.finish()),
+            Arc::new(self.path_sha256_col.finish()),
             Arc::new(self.composite_sha256_col.finish()),
-            Arc::new(self.size_bytes_col.finish()),
-            Arc::new(self.path_col.finish()),
-            Arc::new(self.symlink_target_col.finish()),
         ];
         self.len = 0;
         RecordBatch::try_new(Arc::clone(schema), columns)
@@ -157,58 +265,393 @@ impl ColumnarBatchBuffer {
     }
 }
 
-/// Dedicated single-consumer streaming Apache Parquet writer loop.
-pub fn run_parquet_writer_loop(
-    rx: Receiver<Vec<ScanRecord>>,
-    sink: BufWriter<Box<dyn Write + Send>>,
-    compression: ParquetCompression,
-    row_group_size: usize,
-) -> io::Result<()> {
-    let schema = build_parquet_schema();
-    let props = build_writer_properties(compression, row_group_size);
+/// Columnar batch builder for `ScanRecord::Symlink` matching `build_symlink_parquet_schema()`.
+struct SymlinkColumnarBuffer {
+    len: usize,
+    path_col: StringBuilder,
+    symlink_target_col: StringBuilder,
+    mode_octal_col: StringBuilder,
+    mode_col: UInt32Builder,
+    mode_sha256_col: StringBuilder,
+    name_sha256_col: StringBuilder,
+    target_sha256_col: StringBuilder,
+    composite_sha256_col: StringBuilder,
+}
 
-    let mut arrow_writer = ArrowWriter::try_new(sink, Arc::clone(&schema), Some(props))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    let batch_rows = row_group_size.max(1024);
-    let mut col_buf = ColumnarBatchBuffer::with_capacity(batch_rows);
-
-    let mut mode_octal = [0u8; 7];
-    let mut mode_hex = [0u8; 64];
-    let mut name_hex = [0u8; 64];
-    let mut payload_hex = [0u8; 64];
-    let mut comp_hex = [0u8; 64];
-
-    for batch in rx {
-        for rec in batch {
-            col_buf.push(
-                &rec,
-                &mut mode_octal,
-                &mut mode_hex,
-                &mut name_hex,
-                &mut payload_hex,
-                &mut comp_hex,
-            );
-
-            if col_buf.len >= batch_rows {
-                let record_batch = col_buf.flush_batch(&schema)?;
-                arrow_writer
-                    .write(&record_batch)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            }
+impl SymlinkColumnarBuffer {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            len: 0,
+            path_col: StringBuilder::with_capacity(cap, cap * 48),
+            symlink_target_col: StringBuilder::with_capacity(cap, cap * 48),
+            mode_octal_col: StringBuilder::with_capacity(cap, cap * 7),
+            mode_col: UInt32Builder::with_capacity(cap),
+            mode_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            name_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            target_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            composite_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
         }
     }
 
-    if col_buf.len > 0 {
-        let record_batch = col_buf.flush_batch(&schema)?;
-        arrow_writer
-            .write(&record_batch)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    #[inline]
+    fn push(
+        &mut self,
+        path: &Path,
+        symlink_target: &Path,
+        mode: u32,
+        mode_sha256: &[u8; 32],
+        name_sha256: &[u8; 32],
+        target_sha256: &[u8; 32],
+        composite_sha256: &[u8; 32],
+        octal_buf: &mut [u8; 7],
+        hex_buf: &mut [u8; 64],
+    ) {
+        self.path_col.append_value(path.to_string_lossy().as_ref());
+        self.symlink_target_col
+            .append_value(symlink_target.to_string_lossy().as_ref());
+
+        format_octal_mode(mode, octal_buf);
+        self.mode_octal_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(octal_buf) });
+        self.mode_col.append_value(mode);
+
+        encode_hex_64(mode_sha256, hex_buf);
+        self.mode_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        encode_hex_64(name_sha256, hex_buf);
+        self.name_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        encode_hex_64(target_sha256, hex_buf);
+        self.target_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        encode_hex_64(composite_sha256, hex_buf);
+        self.composite_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        self.len += 1;
     }
 
-    arrow_writer
-        .close()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    fn flush_batch(&mut self, schema: &Arc<Schema>) -> io::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.path_col.finish()),
+            Arc::new(self.symlink_target_col.finish()),
+            Arc::new(self.mode_octal_col.finish()),
+            Arc::new(self.mode_col.finish()),
+            Arc::new(self.mode_sha256_col.finish()),
+            Arc::new(self.name_sha256_col.finish()),
+            Arc::new(self.target_sha256_col.finish()),
+            Arc::new(self.composite_sha256_col.finish()),
+        ];
+        self.len = 0;
+        RecordBatch::try_new(Arc::clone(schema), columns)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
 
-    Ok(())
+/// Columnar batch builder for `ScanRecord::File` matching `build_file_parquet_schema()`.
+struct FileColumnarBuffer {
+    len: usize,
+    path_col: StringBuilder,
+    size_bytes_col: UInt64Builder,
+    mode_octal_col: StringBuilder,
+    mode_col: UInt32Builder,
+    mode_sha256_col: StringBuilder,
+    name_sha256_col: StringBuilder,
+    content_sha256_col: StringBuilder,
+    composite_sha256_col: StringBuilder,
+}
+
+impl FileColumnarBuffer {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            len: 0,
+            path_col: StringBuilder::with_capacity(cap, cap * 48),
+            size_bytes_col: UInt64Builder::with_capacity(cap),
+            mode_octal_col: StringBuilder::with_capacity(cap, cap * 7),
+            mode_col: UInt32Builder::with_capacity(cap),
+            mode_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            name_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            content_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+            composite_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
+        }
+    }
+
+    #[inline]
+    fn push(
+        &mut self,
+        path: &Path,
+        size_bytes: u64,
+        mode: u32,
+        mode_sha256: &[u8; 32],
+        name_sha256: &[u8; 32],
+        content_sha256: &[u8; 32],
+        composite_sha256: &[u8; 32],
+        octal_buf: &mut [u8; 7],
+        hex_buf: &mut [u8; 64],
+    ) {
+        self.path_col.append_value(path.to_string_lossy().as_ref());
+        self.size_bytes_col.append_value(size_bytes);
+
+        format_octal_mode(mode, octal_buf);
+        self.mode_octal_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(octal_buf) });
+        self.mode_col.append_value(mode);
+
+        encode_hex_64(mode_sha256, hex_buf);
+        self.mode_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        encode_hex_64(name_sha256, hex_buf);
+        self.name_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        encode_hex_64(content_sha256, hex_buf);
+        self.content_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        encode_hex_64(composite_sha256, hex_buf);
+        self.composite_sha256_col
+            .append_value(unsafe { std::str::from_utf8_unchecked(hex_buf) });
+
+        self.len += 1;
+    }
+
+    fn flush_batch(&mut self, schema: &Arc<Schema>) -> io::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.path_col.finish()),
+            Arc::new(self.size_bytes_col.finish()),
+            Arc::new(self.mode_octal_col.finish()),
+            Arc::new(self.mode_col.finish()),
+            Arc::new(self.mode_sha256_col.finish()),
+            Arc::new(self.name_sha256_col.finish()),
+            Arc::new(self.content_sha256_col.finish()),
+            Arc::new(self.composite_sha256_col.finish()),
+        ];
+        self.len = 0;
+        RecordBatch::try_new(Arc::clone(schema), columns)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// Initializes a `DeltaTable` at `namespace_dir` with the specified `table_name` and `fields`.
+pub async fn init_delta_namespace_table(
+    namespace_dir: &Path,
+    table_name: &str,
+    fields: Vec<StructField>,
+) -> io::Result<DeltaTable> {
+    fs::create_dir_all(namespace_dir)?;
+    let abs_dir = fs::canonicalize(namespace_dir)?;
+    let uri = url::Url::from_directory_path(&abs_dir).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid directory path for Delta namespace: {}", abs_dir.display()),
+        )
+    })?;
+
+    CreateBuilder::new()
+        .with_location(uri.as_str())
+        .with_table_name(table_name)
+        .with_columns(fields)
+        .with_save_mode(SaveMode::Overwrite)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
+/// Dedicated single-consumer streaming `delta-rs` writer loop that routes `ScanRecord::Directory`,
+/// `ScanRecord::Symlink`, and `ScanRecord::File` into their three respective Delta Lake namespaces
+/// (`<root>/directories`, `<root>/symlinks`, `<root>/files`) and commits all three transaction logs
+/// concurrently upon completion.
+pub fn run_parquet_writer_loop(
+    rx: Receiver<Vec<ScanRecord>>,
+    base_output_path: &Path,
+    compression: ParquetCompression,
+    row_group_size: usize,
+) -> io::Result<()> {
+    let ns_paths = DeltaNamespacePaths::from_base_path(base_output_path);
+    ns_paths.ensure_directories_exist()?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async move {
+        // Initialize all 3 Delta Lake namespace tables concurrently
+        let (mut dir_table, mut sym_table, mut file_table) = tokio::try_join!(
+            init_delta_namespace_table(
+                &ns_paths.directories_ns,
+                "directories",
+                build_directory_delta_fields()
+            ),
+            init_delta_namespace_table(
+                &ns_paths.symlinks_ns,
+                "symlinks",
+                build_symlink_delta_fields()
+            ),
+            init_delta_namespace_table(&ns_paths.files_ns, "files", build_file_delta_fields()),
+        )?;
+
+        let dir_schema = build_directory_parquet_schema();
+        let sym_schema = build_symlink_parquet_schema();
+        let file_schema = build_file_parquet_schema();
+
+        let dir_props = build_writer_properties(compression, row_group_size);
+        let sym_props = build_writer_properties(compression, row_group_size);
+        let file_props = build_writer_properties(compression, row_group_size);
+
+        let mut dir_writer = RecordBatchWriter::for_table(&dir_table)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .with_writer_properties(dir_props);
+        let mut sym_writer = RecordBatchWriter::for_table(&sym_table)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .with_writer_properties(sym_props);
+        let mut file_writer = RecordBatchWriter::for_table(&file_table)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .with_writer_properties(file_props);
+
+        let batch_rows = row_group_size.max(1024);
+        let mut dir_buf = DirectoryColumnarBuffer::with_capacity(batch_rows.min(16_384));
+        let mut sym_buf = SymlinkColumnarBuffer::with_capacity(batch_rows.min(4_096));
+        let mut file_buf = FileColumnarBuffer::with_capacity(batch_rows);
+
+        let mut octal_buf = [0u8; 7];
+        let mut hex_buf = [0u8; 64];
+
+        for batch in rx {
+            for rec in batch {
+                match rec {
+                    ScanRecord::Directory {
+                        ref path,
+                        mode,
+                        ref mode_sha256,
+                        ref name_sha256,
+                        ref path_sha256,
+                        ref composite_sha256,
+                    } => {
+                        dir_buf.push(
+                            path,
+                            mode,
+                            mode_sha256,
+                            name_sha256,
+                            path_sha256,
+                            composite_sha256,
+                            &mut octal_buf,
+                            &mut hex_buf,
+                        );
+                        if dir_buf.len >= batch_rows {
+                            let rb = dir_buf.flush_batch(&dir_schema)?;
+                            dir_writer
+                                .write(rb)
+                                .await
+                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        }
+                    }
+                    ScanRecord::Symlink {
+                        ref path,
+                        ref symlink_target,
+                        mode,
+                        ref mode_sha256,
+                        ref name_sha256,
+                        ref target_sha256,
+                        ref composite_sha256,
+                    } => {
+                        sym_buf.push(
+                            path,
+                            symlink_target,
+                            mode,
+                            mode_sha256,
+                            name_sha256,
+                            target_sha256,
+                            composite_sha256,
+                            &mut octal_buf,
+                            &mut hex_buf,
+                        );
+                        if sym_buf.len >= batch_rows {
+                            let rb = sym_buf.flush_batch(&sym_schema)?;
+                            sym_writer
+                                .write(rb)
+                                .await
+                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        }
+                    }
+                    ScanRecord::File {
+                        ref path,
+                        size_bytes,
+                        mode,
+                        ref mode_sha256,
+                        ref name_sha256,
+                        ref content_sha256,
+                        ref composite_sha256,
+                    } => {
+                        file_buf.push(
+                            path,
+                            size_bytes,
+                            mode,
+                            mode_sha256,
+                            name_sha256,
+                            content_sha256,
+                            composite_sha256,
+                            &mut octal_buf,
+                            &mut hex_buf,
+                        );
+                        if file_buf.len >= batch_rows {
+                            let rb = file_buf.flush_batch(&file_schema)?;
+                            file_writer
+                                .write(rb)
+                                .await
+                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        }
+                    }
+                }
+            }
+        }
+
+        if dir_buf.len > 0 {
+            let rb = dir_buf.flush_batch(&dir_schema)?;
+            dir_writer
+                .write(rb)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+        if sym_buf.len > 0 {
+            let rb = sym_buf.flush_batch(&sym_schema)?;
+            sym_writer
+                .write(rb)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+        if file_buf.len > 0 {
+            let rb = file_buf.flush_batch(&file_schema)?;
+            file_writer
+                .write(rb)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+
+        // Commit all three Delta Lake namespace transaction logs concurrently
+        let commit_dir = async {
+            dir_writer
+                .flush_and_commit(&mut dir_table)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        };
+        let commit_sym = async {
+            sym_writer
+                .flush_and_commit(&mut sym_table)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        };
+        let commit_file = async {
+            file_writer
+                .flush_and_commit(&mut file_table)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        };
+
+        tokio::try_join!(commit_dir, commit_sym, commit_file)?;
+        Ok(())
+    })
 }
