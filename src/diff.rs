@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::builder::{StringBuilder, UInt32Builder, UInt64Builder};
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use arrow_array::builder::{Int32Builder, Int64Builder, StringBuilder};
+use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use crossbeam_channel::{Receiver, Sender};
 use deltalake::kernel::{DataType as DeltaDataType, PrimitiveType, StructField};
@@ -300,10 +300,15 @@ fn parse_record_batch_into_scan_records(batch: &RecordBatch) -> io::Result<Vec<S
         .column_by_name("path")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing 'path' column"))?;
-    let mode_col = batch
+    let mode_col_i32 = batch
         .column_by_name("mode")
-        .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing 'mode' column"))?;
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>());
+    let mode_col_u32 = batch
+        .column_by_name("mode")
+        .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+    if mode_col_i32.is_none() && mode_col_u32.is_none() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Missing or invalid 'mode' column"));
+    }
     let mode_sha_col = batch
         .column_by_name("mode_sha256")
         .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -320,12 +325,15 @@ fn parse_record_batch_into_scan_records(batch: &RecordBatch) -> io::Result<Vec<S
     let mut records = Vec::with_capacity(num_rows);
 
     if has_content_sha {
-        let size_col = batch
+        let size_col_i64 = batch
             .column_by_name("size_bytes")
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "Missing 'size_bytes' column")
-            })?;
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+        let size_col_u64 = batch
+            .column_by_name("size_bytes")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+        if size_col_i64.is_none() && size_col_u64.is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Missing or invalid 'size_bytes' column"));
+        }
         let content_col = batch
             .column_by_name("content_sha256")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>())
@@ -335,7 +343,7 @@ fn parse_record_batch_into_scan_records(batch: &RecordBatch) -> io::Result<Vec<S
 
         for i in 0..num_rows {
             let path = PathBuf::from(path_col.value(i));
-            let mode = mode_col.value(i);
+            let mode = mode_col_i32.map(|c| c.value(i) as u32).unwrap_or_else(|| mode_col_u32.unwrap().value(i));
             let mode_sha256 = match mode_sha_col {
                 Some(c) => decode_hex_32(c.value(i))?,
                 None => hash_mode(mode),
@@ -346,7 +354,7 @@ fn parse_record_batch_into_scan_records(batch: &RecordBatch) -> io::Result<Vec<S
             };
             records.push(ScanRecord::File {
                 path,
-                size_bytes: size_col.value(i),
+                size_bytes: size_col_i64.map(|c| c.value(i) as u64).unwrap_or_else(|| size_col_u64.unwrap().value(i)),
                 mode,
                 mode_sha256,
                 name_sha256,
@@ -371,7 +379,7 @@ fn parse_record_batch_into_scan_records(batch: &RecordBatch) -> io::Result<Vec<S
         for i in 0..num_rows {
             let path = PathBuf::from(path_col.value(i));
             let symlink_target = PathBuf::from(target_path_col.value(i));
-            let mode = mode_col.value(i);
+            let mode = mode_col_i32.map(|c| c.value(i) as u32).unwrap_or_else(|| mode_col_u32.unwrap().value(i));
             let mode_sha256 = match mode_sha_col {
                 Some(c) => decode_hex_32(c.value(i))?,
                 None => hash_mode(mode),
@@ -400,7 +408,7 @@ fn parse_record_batch_into_scan_records(batch: &RecordBatch) -> io::Result<Vec<S
 
         for i in 0..num_rows {
             let path = PathBuf::from(path_col.value(i));
-            let mode = mode_col.value(i);
+            let mode = mode_col_i32.map(|c| c.value(i) as u32).unwrap_or_else(|| mode_col_u32.unwrap().value(i));
             let mode_sha256 = match mode_sha_col {
                 Some(c) => decode_hex_32(c.value(i))?,
                 None => hash_mode(mode),
@@ -722,10 +730,10 @@ pub fn build_diff_parquet_schema() -> Arc<Schema> {
         Field::new("new_kind", DataType::Utf8, true),
         Field::new("old_mode_octal", DataType::Utf8, true),
         Field::new("new_mode_octal", DataType::Utf8, true),
-        Field::new("old_mode", DataType::UInt32, true),
-        Field::new("new_mode", DataType::UInt32, true),
-        Field::new("old_size_bytes", DataType::UInt64, true),
-        Field::new("new_size_bytes", DataType::UInt64, true),
+        Field::new("old_mode", DataType::Int32, true),
+        Field::new("new_mode", DataType::Int32, true),
+        Field::new("old_size_bytes", DataType::Int64, true),
+        Field::new("new_size_bytes", DataType::Int64, true),
         Field::new("old_payload_sha256", DataType::Utf8, true),
         Field::new("new_payload_sha256", DataType::Utf8, true),
         Field::new("old_composite_sha256", DataType::Utf8, true),
@@ -982,10 +990,10 @@ fn run_diff_delta_writer_loop(
         let mut new_kind_col = StringBuilder::with_capacity(cap, cap * 5);
         let mut old_octal_col = StringBuilder::with_capacity(cap, cap * 7);
         let mut new_octal_col = StringBuilder::with_capacity(cap, cap * 7);
-        let mut old_mode_col = UInt32Builder::with_capacity(cap);
-        let mut new_mode_col = UInt32Builder::with_capacity(cap);
-        let mut old_size_col = UInt64Builder::with_capacity(cap);
-        let mut new_size_col = UInt64Builder::with_capacity(cap);
+        let mut old_mode_col = Int32Builder::with_capacity(cap);
+        let mut new_mode_col = Int32Builder::with_capacity(cap);
+        let mut old_size_col = Int64Builder::with_capacity(cap);
+        let mut new_size_col = Int64Builder::with_capacity(cap);
         let mut old_pay_col = StringBuilder::with_capacity(cap, cap * 64);
         let mut new_pay_col = StringBuilder::with_capacity(cap, cap * 64);
         let mut old_comp_col = StringBuilder::with_capacity(cap, cap * 64);
@@ -1015,7 +1023,7 @@ fn run_diff_delta_writer_loop(
                         format_octal_mode(m, &mut octal_buf);
                         let s = unsafe { std::str::from_utf8_unchecked(&octal_buf) };
                         old_octal_col.append_value(s);
-                        old_mode_col.append_value(m);
+                        old_mode_col.append_value(m as i32);
                     }
                     None => {
                         old_octal_col.append_null();
@@ -1027,7 +1035,7 @@ fn run_diff_delta_writer_loop(
                         format_octal_mode(m, &mut octal_buf);
                         let s = unsafe { std::str::from_utf8_unchecked(&octal_buf) };
                         new_octal_col.append_value(s);
-                        new_mode_col.append_value(m);
+                        new_mode_col.append_value(m as i32);
                     }
                     None => {
                         new_octal_col.append_null();
@@ -1035,11 +1043,11 @@ fn run_diff_delta_writer_loop(
                     }
                 }
                 match rec.old_size_bytes {
-                    Some(sz) => old_size_col.append_value(sz),
+                    Some(sz) => old_size_col.append_value(sz as i64),
                     None => old_size_col.append_null(),
                 }
                 match rec.new_size_bytes {
-                    Some(sz) => new_size_col.append_value(sz),
+                    Some(sz) => new_size_col.append_value(sz as i64),
                     None => new_size_col.append_null(),
                 }
                 match rec.old_payload_sha256 {

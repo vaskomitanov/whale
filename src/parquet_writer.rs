@@ -32,7 +32,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::builder::{StringBuilder, UInt32Builder, UInt64Builder};
+use arrow_array::builder::{Int32Builder, Int64Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use crossbeam_channel::Receiver;
@@ -54,7 +54,7 @@ pub fn build_directory_parquet_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("path", DataType::Utf8, false),
         Field::new("mode_octal", DataType::Utf8, false),
-        Field::new("mode", DataType::UInt32, false),
+        Field::new("mode", DataType::Int32, false),
         Field::new("mode_sha256", DataType::Utf8, false),
         Field::new("name_sha256", DataType::Utf8, false),
         Field::new("path_sha256", DataType::Utf8, false),
@@ -81,7 +81,7 @@ pub fn build_symlink_parquet_schema() -> Arc<Schema> {
         Field::new("path", DataType::Utf8, false),
         Field::new("symlink_target", DataType::Utf8, false),
         Field::new("mode_octal", DataType::Utf8, false),
-        Field::new("mode", DataType::UInt32, false),
+        Field::new("mode", DataType::Int32, false),
         Field::new("mode_sha256", DataType::Utf8, false),
         Field::new("name_sha256", DataType::Utf8, false),
         Field::new("target_sha256", DataType::Utf8, false),
@@ -107,9 +107,9 @@ pub fn build_symlink_delta_fields() -> Vec<StructField> {
 pub fn build_file_parquet_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("path", DataType::Utf8, false),
-        Field::new("size_bytes", DataType::UInt64, false),
+        Field::new("size_bytes", DataType::Int64, false),
         Field::new("mode_octal", DataType::Utf8, false),
-        Field::new("mode", DataType::UInt32, false),
+        Field::new("mode", DataType::Int32, false),
         Field::new("mode_sha256", DataType::Utf8, false),
         Field::new("name_sha256", DataType::Utf8, false),
         Field::new("content_sha256", DataType::Utf8, false),
@@ -190,7 +190,7 @@ struct DirectoryColumnarBuffer {
     len: usize,
     path_col: StringBuilder,
     mode_octal_col: StringBuilder,
-    mode_col: UInt32Builder,
+    mode_col: Int32Builder,
     mode_sha256_col: StringBuilder,
     name_sha256_col: StringBuilder,
     path_sha256_col: StringBuilder,
@@ -203,7 +203,7 @@ impl DirectoryColumnarBuffer {
             len: 0,
             path_col: StringBuilder::with_capacity(cap, cap * 48),
             mode_octal_col: StringBuilder::with_capacity(cap, cap * 7),
-            mode_col: UInt32Builder::with_capacity(cap),
+            mode_col: Int32Builder::with_capacity(cap),
             mode_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
             name_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
             path_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
@@ -228,7 +228,7 @@ impl DirectoryColumnarBuffer {
         format_octal_mode(mode, octal_buf);
         self.mode_octal_col
             .append_value(unsafe { std::str::from_utf8_unchecked(octal_buf) });
-        self.mode_col.append_value(mode);
+        self.mode_col.append_value(mode as i32);
 
         encode_hex_64(mode_sha256, hex_buf);
         self.mode_sha256_col
@@ -271,7 +271,7 @@ struct SymlinkColumnarBuffer {
     path_col: StringBuilder,
     symlink_target_col: StringBuilder,
     mode_octal_col: StringBuilder,
-    mode_col: UInt32Builder,
+    mode_col: Int32Builder,
     mode_sha256_col: StringBuilder,
     name_sha256_col: StringBuilder,
     target_sha256_col: StringBuilder,
@@ -285,7 +285,7 @@ impl SymlinkColumnarBuffer {
             path_col: StringBuilder::with_capacity(cap, cap * 48),
             symlink_target_col: StringBuilder::with_capacity(cap, cap * 48),
             mode_octal_col: StringBuilder::with_capacity(cap, cap * 7),
-            mode_col: UInt32Builder::with_capacity(cap),
+            mode_col: Int32Builder::with_capacity(cap),
             mode_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
             name_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
             target_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
@@ -313,7 +313,7 @@ impl SymlinkColumnarBuffer {
         format_octal_mode(mode, octal_buf);
         self.mode_octal_col
             .append_value(unsafe { std::str::from_utf8_unchecked(octal_buf) });
-        self.mode_col.append_value(mode);
+        self.mode_col.append_value(mode as i32);
 
         encode_hex_64(mode_sha256, hex_buf);
         self.mode_sha256_col
@@ -355,9 +355,9 @@ impl SymlinkColumnarBuffer {
 struct FileColumnarBuffer {
     len: usize,
     path_col: StringBuilder,
-    size_bytes_col: UInt64Builder,
+    size_bytes_col: Int64Builder,
     mode_octal_col: StringBuilder,
-    mode_col: UInt32Builder,
+    mode_col: Int32Builder,
     mode_sha256_col: StringBuilder,
     name_sha256_col: StringBuilder,
     content_sha256_col: StringBuilder,
@@ -369,9 +369,9 @@ impl FileColumnarBuffer {
         Self {
             len: 0,
             path_col: StringBuilder::with_capacity(cap, cap * 48),
-            size_bytes_col: UInt64Builder::with_capacity(cap),
+            size_bytes_col: Int64Builder::with_capacity(cap),
             mode_octal_col: StringBuilder::with_capacity(cap, cap * 7),
-            mode_col: UInt32Builder::with_capacity(cap),
+            mode_col: Int32Builder::with_capacity(cap),
             mode_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
             name_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
             content_sha256_col: StringBuilder::with_capacity(cap, cap * 64),
@@ -393,12 +393,12 @@ impl FileColumnarBuffer {
         hex_buf: &mut [u8; 64],
     ) {
         self.path_col.append_value(path.to_string_lossy().as_ref());
-        self.size_bytes_col.append_value(size_bytes);
+        self.size_bytes_col.append_value(size_bytes as i64);
 
         format_octal_mode(mode, octal_buf);
         self.mode_octal_col
             .append_value(unsafe { std::str::from_utf8_unchecked(octal_buf) });
-        self.mode_col.append_value(mode);
+        self.mode_col.append_value(mode as i32);
 
         encode_hex_64(mode_sha256, hex_buf);
         self.mode_sha256_col
