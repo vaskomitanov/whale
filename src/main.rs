@@ -46,30 +46,6 @@ fn main() -> io::Result<()> {
         &telemetry.multiset_hash,
         b"ROOT_ALL_V2:",
     ));
-    let root_file_contents_sha256 = format_hex_string(&ScanTelemetry::finalize_accumulator(
-        &telemetry.file_content_multiset,
-        b"FILE_CONTENTS_V1:",
-    ));
-    let root_file_names_sha256 = format_hex_string(&ScanTelemetry::finalize_accumulator(
-        &telemetry.file_name_multiset,
-        b"FILE_NAMES_V1:",
-    ));
-    let root_file_modes_sha256 = format_hex_string(&ScanTelemetry::finalize_accumulator(
-        &telemetry.file_mode_multiset,
-        b"FILE_MODES_V1:",
-    ));
-    let root_dir_names_sha256 = format_hex_string(&ScanTelemetry::finalize_accumulator(
-        &telemetry.dir_name_multiset,
-        b"DIR_NAMES_V1:",
-    ));
-    let root_dir_modes_sha256 = format_hex_string(&ScanTelemetry::finalize_accumulator(
-        &telemetry.dir_mode_multiset,
-        b"DIR_MODES_V1:",
-    ));
-    let root_symlinks_sha256 = format_hex_string(&ScanTelemetry::finalize_accumulator(
-        &telemetry.symlink_multiset,
-        b"SYMLINKS_V1:",
-    ));
 
     let mut summary_out: Box<dyn Write> = match summary_output_file {
         Some(ref path) => Box::new(BufWriter::new(File::create(path)?)),
@@ -120,40 +96,9 @@ fn main() -> io::Result<()> {
             telemetry.modified_type_count.load(Ordering::Relaxed),
         )?;
     }
-
     writeln!(
         summary_out,
-        "File Contents SHA-256  : {}",
-        root_file_contents_sha256
-    )?;
-    writeln!(
-        summary_out,
-        "File Names SHA-256     : {}",
-        root_file_names_sha256
-    )?;
-    writeln!(
-        summary_out,
-        "File Modes SHA-256     : {}",
-        root_file_modes_sha256
-    )?;
-    writeln!(
-        summary_out,
-        "Directory Names SHA-256: {}",
-        root_dir_names_sha256
-    )?;
-    writeln!(
-        summary_out,
-        "Directory Modes SHA-256: {}",
-        root_dir_modes_sha256
-    )?;
-    writeln!(
-        summary_out,
-        "Symlinks SHA-256       : {}",
-        root_symlinks_sha256
-    )?;
-    writeln!(
-        summary_out,
-        "Aggregate Tree SHA-256 : {}",
+        "Tree SHA-256 : {}",
         root_all_sha256
     )?;
     summary_out.flush()?;

@@ -457,7 +457,7 @@ pub async fn init_delta_namespace_table(
         .with_columns(fields)
         .with_save_mode(SaveMode::Overwrite)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
 }
 
 /// Dedicated single-consumer streaming `delta-rs` writer loop that routes `ScanRecord::Directory`,
@@ -503,13 +503,13 @@ pub fn run_parquet_writer_loop(
         let file_props = build_writer_properties(compression, row_group_size);
 
         let mut dir_writer = RecordBatchWriter::for_table(&dir_table)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .with_writer_properties(dir_props);
         let mut sym_writer = RecordBatchWriter::for_table(&sym_table)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .with_writer_properties(sym_props);
         let mut file_writer = RecordBatchWriter::for_table(&file_table)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .with_writer_properties(file_props);
 
         let batch_rows = row_group_size.max(1024);
@@ -546,7 +546,7 @@ pub fn run_parquet_writer_loop(
                             dir_writer
                                 .write(rb)
                                 .await
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                                .map_err(io::Error::other)?;
                         }
                     }
                     ScanRecord::Symlink {
@@ -574,7 +574,7 @@ pub fn run_parquet_writer_loop(
                             sym_writer
                                 .write(rb)
                                 .await
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                                .map_err(io::Error::other)?;
                         }
                     }
                     ScanRecord::File {
@@ -602,7 +602,7 @@ pub fn run_parquet_writer_loop(
                             file_writer
                                 .write(rb)
                                 .await
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                                .map_err(io::Error::other)?;
                         }
                     }
                 }
@@ -614,21 +614,21 @@ pub fn run_parquet_writer_loop(
             dir_writer
                 .write(rb)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
         }
         if sym_buf.len > 0 {
             let rb = sym_buf.flush_batch(&sym_schema)?;
             sym_writer
                 .write(rb)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
         }
         if file_buf.len > 0 {
             let rb = file_buf.flush_batch(&file_schema)?;
             file_writer
                 .write(rb)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
         }
 
         // Commit all three Delta Lake namespace transaction logs concurrently
@@ -636,19 +636,19 @@ pub fn run_parquet_writer_loop(
             dir_writer
                 .flush_and_commit(&mut dir_table)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                .map_err(io::Error::other)
         };
         let commit_sym = async {
             sym_writer
                 .flush_and_commit(&mut sym_table)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                .map_err(io::Error::other)
         };
         let commit_file = async {
             file_writer
                 .flush_and_commit(&mut file_table)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                .map_err(io::Error::other)
         };
 
         tokio::try_join!(commit_dir, commit_sym, commit_file)?;

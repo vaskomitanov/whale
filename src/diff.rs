@@ -205,15 +205,15 @@ async fn collect_delta_namespace_parquet_files(
     let table = match version {
         Some(v) => deltalake::open_table_with_version(uri.as_str(), v)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
+            .map_err(io::Error::other)?,
         None => deltalake::open_table(uri.as_str())
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
+            .map_err(io::Error::other)?,
     };
 
     let uris = table
         .get_file_uris()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
     let mut files = Vec::new();
     for u in uris {
@@ -980,7 +980,7 @@ fn run_diff_delta_writer_loop(
         let schema = build_diff_parquet_schema();
         let props = build_writer_properties(compression, row_group_size);
         let mut delta_writer = RecordBatchWriter::for_table(&diff_table)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .with_writer_properties(props);
 
         let cap = row_group_size.max(1024);
@@ -1117,7 +1117,7 @@ fn run_diff_delta_writer_loop(
                     delta_writer
                         .write(rb)
                         .await
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        .map_err(io::Error::other)?;
                 }
             }
         }
@@ -1146,13 +1146,13 @@ fn run_diff_delta_writer_loop(
             delta_writer
                 .write(rb)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
         }
 
         delta_writer
             .flush_and_commit(&mut diff_table)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         Ok(())
     })
